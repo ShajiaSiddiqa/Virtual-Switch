@@ -1,0 +1,9 @@
+
+# Ignore object files
+*.o
+
+# Ignore PDF files
+*.pdf
+
+# Ignore HTML files
+*.html
