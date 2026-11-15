@@ -8,6 +8,7 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <string.h>
+#include <signal.h>
 
 #define MAX_TEST_PORTS 64
 
@@ -17,25 +18,63 @@ static int parse_number(const char *text, long max)
     errno = 0;
     long value = strtol(text, &end, 10);
 
-    if (errno != 0 || end == text || *end != '\0' ||
-        value < 1 || value > max) {
+    if (errno != 0 || end == text || *end != '\0' || value < 1 || value > max) 
         return -1;
-    }
 
     return (int)value;
 }
 
-static int receive_frames(int client)
+
+typedef struct {
+    int fd;
+    int status;
+    const int *clients;
+    int num_ports;
+} Receiver;
+
+static pthread_mutex_t flood_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static int flood_frame(const Receiver *source, const FrameHeader *header, const uint8_t *payload)
+{
+    int error = pthread_mutex_lock(&flood_lock);
+    if (error != 0) {
+        fprintf(stderr, "pthread_mutex_lock: %s\n", strerror(error));
+        return EXIT_FAILURE;
+    }
+
+    for (int i = 0; i < source->num_ports; i++) {
+        int target = source->clients[i];
+
+        if (target == source->fd) {
+            continue;
+        }
+
+        if (frame_write(target, header, payload) != 0) {
+            perror("frame_write");
+        }
+    }
+
+    error = pthread_mutex_unlock(&flood_lock);
+    if (error != 0) {
+        fprintf(stderr, "pthread_mutex_unlock: %s\n", strerror(error));
+        return EXIT_FAILURE;
+    }
+
+    return EXIT_SUCCESS;
+}
+
+static int receive_frames(const Receiver *receiver)
 {
     FrameHeader header;
     uint8_t payload[FRAME_MAX_PAYLOAD];
 
     for (;;) {
-        int result = frame_read(client, &header, payload);
+        int result = frame_read(receiver->fd, &header, payload);
 
         if (result == 0) {
             return EXIT_SUCCESS;
         }
+
         if (result < 0) {
             perror("frame_read");
             return EXIT_FAILURE;
@@ -49,29 +88,30 @@ static int receive_frames(int client)
             perror("print frame");
             return EXIT_FAILURE;
         }
+
+        if (flood_frame(receiver, &header, payload) != EXIT_SUCCESS) {
+            return EXIT_FAILURE;
+        }
     }
 }
-
-typedef struct {
-    int fd;
-    int status;
-} Receiver;
 
 static void *receiver_thread(void *arg)
 {
     Receiver *receiver = arg;
-    receiver->status = receive_frames(receiver->fd);
+    receiver->status = receive_frames(receiver);
     return NULL;
 }
 
 static int serve_hosts(int listener, int num_ports)
 {
+    int clients[MAX_TEST_PORTS];
     Receiver receivers[MAX_TEST_PORTS];
     pthread_t threads[MAX_TEST_PORTS];
+    int accepted = 0;
     int started = 0;
     int status = EXIT_SUCCESS;
 
-    while (started < num_ports) {
+    while (accepted < num_ports) {
         int client;
         do {
             client = accept(listener, NULL, NULL);
@@ -83,14 +123,20 @@ static int serve_hosts(int listener, int num_ports)
             break;
         }
 
-        receivers[started] = (Receiver){.fd = client};
+        clients[accepted++] = client;
+    }
+
+    while (status == EXIT_SUCCESS && started < accepted) {
+        receivers[started] = (Receiver){
+            .fd = clients[started],
+            .clients = clients,
+            .num_ports = accepted
+        };
+
         int error = pthread_create(&threads[started], NULL, receiver_thread,
                                    &receivers[started]);
         if (error != 0) {
             fprintf(stderr, "pthread_create: %s\n", strerror(error));
-            if (close(client) == -1) {
-                perror("close client");
-            }
             status = EXIT_FAILURE;
             break;
         }
@@ -99,8 +145,8 @@ static int serve_hosts(int listener, int num_ports)
     }
 
     if (status == EXIT_FAILURE) {
-        for (int i = 0; i < started; i++) {
-            if (shutdown(receivers[i].fd, SHUT_RDWR) == -1 &&
+        for (int i = 0; i < accepted; i++) {
+            if (shutdown(clients[i], SHUT_RDWR) == -1 &&
                 errno != ENOTCONN) {
                 perror("shutdown client");
             }
@@ -117,7 +163,10 @@ static int serve_hosts(int listener, int num_ports)
         if (receivers[i].status != EXIT_SUCCESS) {
             status = EXIT_FAILURE;
         }
-        if (close(receivers[i].fd) == -1) {
+    }
+
+    for (int i = 0; i < accepted; i++) {
+        if (close(clients[i]) == -1) {
             perror("close client");
             status = EXIT_FAILURE;
         }
@@ -128,7 +177,8 @@ static int serve_hosts(int listener, int num_ports)
 
 int main(int argc, char *argv[])
 {
-    if (argc != 3) {
+    if (argc != 3) 
+    {
         fprintf(stderr, "Usage: %s <tcp_port> <num_ports>\n", argv[0]);
         return EXIT_FAILURE;
     }
@@ -136,14 +186,20 @@ int main(int argc, char *argv[])
     int port = parse_number(argv[1], 65535);
     int num_ports = parse_number(argv[2], MAX_TEST_PORTS);
 
-    if (port == -1 || num_ports == -1) {
-        fprintf(stderr, "Use TCP port 1-65535 and num_ports 1-%d.\n",
-                MAX_TEST_PORTS);
+    if (port == -1 || num_ports == -1) 
+    {
+        fprintf(stderr, "Use TCP port 1-65535 and num_ports 1-%d.\n", MAX_TEST_PORTS);
+        return EXIT_FAILURE;
+    }
+
+    if (signal(SIGPIPE, SIG_IGN) == SIG_ERR) {
+        perror("signal");
         return EXIT_FAILURE;
     }
 
     int listener = socket(AF_INET, SOCK_STREAM, 0);
-    if (listener == -1) {
+    if (listener == -1) 
+    {
         perror("socket");
         return EXIT_FAILURE;
     }
@@ -155,12 +211,14 @@ int main(int argc, char *argv[])
         .sin_addr.s_addr = htonl(INADDR_ANY)
     };
 
-    if (bind(listener, (struct sockaddr *)&address, sizeof(address)) == -1) {
+    if (bind(listener, (struct sockaddr *)&address, sizeof(address)) == -1) 
+    {
         perror("bind");
         goto close_listener;
     }
 
-    if (listen(listener, num_ports) == -1) {
+    if (listen(listener, num_ports) == -1) 
+    {
         perror("listen");
         goto close_listener;
     }
@@ -168,7 +226,8 @@ int main(int argc, char *argv[])
     status = serve_hosts(listener, num_ports);
 
 close_listener:
-    if (close(listener) == -1) {
+    if (close(listener) == -1) 
+    {
         perror("close listener");
         status = EXIT_FAILURE;
     }
