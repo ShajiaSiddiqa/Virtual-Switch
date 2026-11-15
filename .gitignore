@@ -41,8 +41,3 @@ switch.local.conf
 *.swp
 *~
 .DS_Store
-/build/
-/switch
-/host
-/lab_test
-*.o
