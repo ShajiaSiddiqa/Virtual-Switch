@@ -7,3 +7,37 @@
 
 # Ignore HTML files
 *.html
+# Compiled objects and binaries
+*.o
+*.out
+*.a
+*.so
+switch
+host
+swctl
+lab_test
+switch_tsan
+race_tsan
+
+# Debug symbols and sanitizer/valgrind output
+*.dSYM/
+*.gcda
+*.gcno
+vgcore.*
+callgrind.out.*
+massif.out.*
+
+# Runtime files created by the switch
+switch.log
+mac-table.txt
+*.sock
+
+# Local config overrides (keep switch.conf as the tracked sample)
+switch.local.conf
+
+# Editor and OS files
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
