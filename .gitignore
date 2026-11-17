@@ -42,3 +42,4 @@ switch.local.conf
 *.swp
 *~
 .DS_Store
+*.log
