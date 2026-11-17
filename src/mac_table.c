@@ -1,3 +1,4 @@
+#define _POSIX_C_SOURCE 200809L
 #include "mac_table.h"
 
 #include <stdio.h>  
@@ -110,6 +111,13 @@ int mac_table_insert(MacTable *table, const uint8_t mac[FRAME_MAC_SIZE], int por
     MacBucket *bucket = &table->buckets[bucket_index(mac)];
     if (pthread_mutex_lock(&bucket->lock) != 0) 
         return -1;
+    
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) == -1) 
+    {
+        pthread_mutex_unlock(&bucket->lock);
+        return -1;
+    }
 
     MacEntry *entry = find_entry(bucket, mac);
 
@@ -117,6 +125,7 @@ int mac_table_insert(MacTable *table, const uint8_t mac[FRAME_MAC_SIZE], int por
     {
         int old_port = entry->port;
         entry->port = port;
+        entry->last_seen = now;
         pthread_mutex_unlock(&bucket->lock);
 
         if (old_port != port) 
@@ -134,9 +143,64 @@ int mac_table_insert(MacTable *table, const uint8_t mac[FRAME_MAC_SIZE], int por
 
     memcpy(entry->mac, mac, FRAME_MAC_SIZE);
     entry->port = port;
+    entry->last_seen = now;
     entry->next = bucket->head;
     bucket->head = entry;
 
     pthread_mutex_unlock(&bucket->lock);
     return 0;
+}
+static int entry_expired(const struct timespec *last_seen,
+                         const struct timespec *now,
+                         unsigned int max_age_seconds)
+{
+    time_t seconds = now->tv_sec - last_seen->tv_sec;
+
+    if (now->tv_nsec < last_seen->tv_nsec) {
+        seconds--;
+    }
+
+    return seconds >= 0 &&
+           (uintmax_t)seconds >= (uintmax_t)max_age_seconds;
+}
+
+int mac_table_expire(MacTable *table, unsigned int max_age_seconds)
+{
+    if (table == NULL || max_age_seconds == 0) {
+        return -1;
+    }
+
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) == -1) {
+        return -1;
+    }
+
+    int removed = 0;
+
+    for (size_t i = 0; i < MAC_TABLE_BUCKETS; i++) {
+        MacBucket *bucket = &table->buckets[i];
+
+        if (pthread_mutex_lock(&bucket->lock) != 0) {
+            return -1;
+        }
+
+        MacEntry **link = &bucket->head;
+        while (*link != NULL) {
+            MacEntry *entry = *link;
+
+            if (entry_expired(&entry->last_seen, &now, max_age_seconds)) {
+                *link = entry->next;
+                free(entry);
+                removed++;
+            } else {
+                link = &entry->next;
+            }
+        }
+
+        if (pthread_mutex_unlock(&bucket->lock) != 0) {
+            return -1;
+        }
+    }
+
+    return removed;
 }
