@@ -1,17 +1,24 @@
 #ifndef MAC_TABLE_H
 #define MAC_TABLE_H
 
+
 #include <time.h>
 #include <pthread.h>
-#include "frame.h"  
+#include "frame.h" 
+#include <stdatomic.h> 
 
 #define MAC_TABLE_BUCKETS 16
+
+#ifndef MAC_TABLE_CAPACITY
+#define MAC_TABLE_CAPACITY 256
+#endif
 
 typedef struct MacEntry {
     uint8_t mac[FRAME_MAC_SIZE];
     int port;
     struct timespec last_seen;
     struct MacEntry *next;
+    uint_fast64_t last_used;
 } MacEntry;
 
 typedef struct {
@@ -21,6 +28,9 @@ typedef struct {
 
 typedef struct {
     MacBucket buckets[MAC_TABLE_BUCKETS];
+    atomic_uint_fast64_t use_sequence;
+    pthread_mutex_t capacity_lock;
+    size_t entry_count;
 } MacTable;
 
 // Initialize an empty table before any threads use it. Returns 0 on success or -1 on error. 

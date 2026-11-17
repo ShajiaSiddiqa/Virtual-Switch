@@ -34,6 +34,12 @@ int mac_table_init(MacTable *table)
     if (table == NULL) 
         return -1;
 
+    atomic_init(&table->use_sequence, 0);
+
+    table->entry_count = 0;
+    if (pthread_mutex_init(&table->capacity_lock, NULL) != 0) 
+        return -1;
+
     for (size_t i = 0; i < MAC_TABLE_BUCKETS; i++) 
     {
         table->buckets[i].head = NULL;
@@ -45,6 +51,7 @@ int mac_table_init(MacTable *table)
                 i--;
                 pthread_mutex_destroy(&table->buckets[i].lock);
             }
+            pthread_mutex_destroy(&table->capacity_lock);
             return -1;
         }
     }
@@ -77,7 +84,15 @@ int mac_table_destroy(MacTable *table)
         }
     }
 
+    if (pthread_mutex_destroy(&table->capacity_lock) != 0) 
+    result = -1;
+
     return result;
+}
+
+static void mark_used(MacTable *table, MacEntry *entry)
+{
+    entry->last_used = atomic_fetch_add_explicit(&table->use_sequence, 1,memory_order_relaxed) + 1;
 }
 
 int mac_table_lookup(MacTable *table, const uint8_t mac[FRAME_MAC_SIZE], int *port)
@@ -95,6 +110,7 @@ int mac_table_lookup(MacTable *table, const uint8_t mac[FRAME_MAC_SIZE], int *po
     if (entry != NULL) 
     {
         *port = entry->port;
+        mark_used(table, entry);
         found = 1;
     }
 
@@ -102,57 +118,127 @@ int mac_table_lookup(MacTable *table, const uint8_t mac[FRAME_MAC_SIZE], int *po
     return found;
 }
 
-int mac_table_insert(MacTable *table, const uint8_t mac[FRAME_MAC_SIZE], int port)
+static int replace_oldest(MacTable *table, size_t target_index,  MacEntry *replacement)
+{
+    size_t locked = 0;
+
+    while (locked < MAC_TABLE_BUCKETS) {
+        if (pthread_mutex_lock(&table->buckets[locked].lock) != 0) {
+            while (locked > 0) {
+                pthread_mutex_unlock(&table->buckets[--locked].lock);
+            }
+            return -1;
+        }
+        locked++;
+    }
+
+    MacEntry **oldest_link = NULL;
+
+    for (size_t i = 0; i < MAC_TABLE_BUCKETS; i++) {
+        for (MacEntry **link = &table->buckets[i].head;
+             *link != NULL; link = &(*link)->next) {
+            if (oldest_link == NULL ||
+                (*link)->last_used < (*oldest_link)->last_used) {
+                oldest_link = link;
+            }
+        }
+    }
+
+    int result = -1;
+    if (oldest_link != NULL) {
+        MacEntry *oldest = *oldest_link;
+        *oldest_link = oldest->next;
+        free(oldest);
+
+        MacBucket *target = &table->buckets[target_index];
+        mark_used(table, replacement);
+        replacement->next = target->head;
+        target->head = replacement;
+        result = 0;
+    }
+
+    while (locked > 0) {
+        pthread_mutex_unlock(&table->buckets[--locked].lock);
+    }
+
+    return result;
+}
+int mac_table_insert(MacTable *table, const uint8_t mac[FRAME_MAC_SIZE],
+                     int port)
 {
     if (table == NULL || mac == NULL || port < 0) {
         return -1;
     }
 
-    MacBucket *bucket = &table->buckets[bucket_index(mac)];
-    if (pthread_mutex_lock(&bucket->lock) != 0) 
+    if (pthread_mutex_lock(&table->capacity_lock) != 0) {
         return -1;
-    
+    }
+
+    size_t index = bucket_index(mac);
+    MacBucket *bucket = &table->buckets[index];
+
+    if (pthread_mutex_lock(&bucket->lock) != 0) {
+        pthread_mutex_unlock(&table->capacity_lock);
+        return -1;
+    }
+
     struct timespec now;
-    if (clock_gettime(CLOCK_MONOTONIC, &now) == -1) 
-    {
+    if (clock_gettime(CLOCK_MONOTONIC, &now) == -1) {
         pthread_mutex_unlock(&bucket->lock);
+        pthread_mutex_unlock(&table->capacity_lock);
         return -1;
     }
 
     MacEntry *entry = find_entry(bucket, mac);
-
-    if (entry != NULL) 
-    {
+    if (entry != NULL) {
         int old_port = entry->port;
         entry->port = port;
         entry->last_seen = now;
+        mark_used(table, entry);
+
         pthread_mutex_unlock(&bucket->lock);
+        pthread_mutex_unlock(&table->capacity_lock);
 
-        if (old_port != port) 
+        if (old_port != port) {
             printf("MAC moved: port %d -> port %d\n", old_port, port);
-
+        }
         return 0;
     }
 
     entry = malloc(sizeof(*entry));
-    if (entry == NULL) 
-    {
+    if (entry == NULL) {
         pthread_mutex_unlock(&bucket->lock);
+        pthread_mutex_unlock(&table->capacity_lock);
         return -1;
     }
 
     memcpy(entry->mac, mac, FRAME_MAC_SIZE);
     entry->port = port;
     entry->last_seen = now;
-    entry->next = bucket->head;
-    bucket->head = entry;
+
+    if (table->entry_count < MAC_TABLE_CAPACITY) {
+        mark_used(table, entry);
+        entry->next = bucket->head;
+        bucket->head = entry;
+        table->entry_count++;
+
+        pthread_mutex_unlock(&bucket->lock);
+        pthread_mutex_unlock(&table->capacity_lock);
+        return 0;
+    }
 
     pthread_mutex_unlock(&bucket->lock);
-    return 0;
+    int result = replace_oldest(table, index, entry);
+    pthread_mutex_unlock(&table->capacity_lock);
+
+    if (result != 0) {
+        free(entry);
+    }
+
+    return result;
 }
-static int entry_expired(const struct timespec *last_seen,
-                         const struct timespec *now,
-                         unsigned int max_age_seconds)
+
+static int entry_expired(const struct timespec *last_seen,const struct timespec *now, unsigned int max_age_seconds)
 {
     time_t seconds = now->tv_sec - last_seen->tv_sec;
 
@@ -164,8 +250,7 @@ static int entry_expired(const struct timespec *last_seen,
            (uintmax_t)seconds >= (uintmax_t)max_age_seconds;
 }
 
-int mac_table_expire(MacTable *table, unsigned int max_age_seconds)
-{
+static int expire_entries(MacTable *table, unsigned int max_age_seconds){
     if (table == NULL || max_age_seconds == 0) {
         return -1;
     }
@@ -191,6 +276,7 @@ int mac_table_expire(MacTable *table, unsigned int max_age_seconds)
             if (entry_expired(&entry->last_seen, &now, max_age_seconds)) {
                 *link = entry->next;
                 free(entry);
+                table->entry_count--;
                 removed++;
             } else {
                 link = &entry->next;
@@ -200,6 +286,25 @@ int mac_table_expire(MacTable *table, unsigned int max_age_seconds)
         if (pthread_mutex_unlock(&bucket->lock) != 0) {
             return -1;
         }
+    }
+
+    return removed;
+}
+
+int mac_table_expire(MacTable *table, unsigned int max_age_seconds)
+{
+    if (table == NULL || max_age_seconds == 0) {
+        return -1;
+    }
+
+    if (pthread_mutex_lock(&table->capacity_lock) != 0) {
+        return -1;
+    }
+
+    int removed = expire_entries(table, max_age_seconds);
+
+    if (pthread_mutex_unlock(&table->capacity_lock) != 0) {
+        return -1;
     }
 
     return removed;
