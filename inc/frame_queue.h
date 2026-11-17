@@ -1,18 +1,18 @@
 #ifndef FRAME_QUEUE_H
 #define FRAME_QUEUE_H
 
-#include "frame.h"
+#include "shared_frame.h"
 #include <pthread.h>
 
 #define FRAME_QUEUE_CAPACITY 8
 
-typedef struct {
-    FrameHeader header;
-    uint8_t payload[FRAME_MAX_PAYLOAD];
-} QueuedFrame;
+// typedef struct {
+//     FrameHeader header;
+//     uint8_t payload[FRAME_MAX_PAYLOAD];
+// } QueuedFrame;
 
 typedef struct {
-    QueuedFrame slots[FRAME_QUEUE_CAPACITY];
+    SharedFrame *slots[FRAME_QUEUE_CAPACITY];
     size_t head;
     size_t count;
     int closed;
@@ -23,10 +23,10 @@ typedef struct {
 void frame_queue_init(FrameQueue *queue);
 
 /* Returns 1 if queued, or 0 if full or closed. */
-int frame_queue_try_push(FrameQueue *queue, const QueuedFrame *frame);
+int frame_queue_try_push(FrameQueue *queue, SharedFrame *frame);
 
 /* Waits for a frame. Returns 1 on success, or 0 when closed and empty. */
-int frame_queue_pop(FrameQueue *queue, QueuedFrame *frame);
+int frame_queue_pop(FrameQueue *queue, SharedFrame **frame);
 
 void frame_queue_close(FrameQueue *queue);
 
