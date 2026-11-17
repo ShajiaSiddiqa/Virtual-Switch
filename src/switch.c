@@ -1,7 +1,9 @@
 #define _POSIX_C_SOURCE 200809L
+#include "io.h"
 #include "frame_io.h"
-#include "frame_queue.h"
 #include "mac_table.h"
+#include "frame_queue.h"
+#include <poll.h>
 #include <time.h>
 #include <errno.h>
 #include <stdio.h>
@@ -11,6 +13,7 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <sys/time.h>
+#include <semaphore.h>
 #include <stdatomic.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
@@ -18,6 +21,8 @@
 #define MAX_TEST_PORTS 64
 #define MAC_AGE_SECONDS 5
 #define MAC_SWEEP_SECONDS 1
+#define PORT_WAIT_SECONDS 2
+
 
 typedef struct {
     MacTable *table;
@@ -40,15 +45,21 @@ static int parse_number(const char *text, long max)
 typedef struct Port {
     int fd;
     int num_ports;
+    sem_t *free_ports;
     FrameQueue output;
     struct Port *ports;
     int receive_status;
     atomic_uint dropped;
     MacTable *mac_table;
+    pthread_mutex_t *ports_lock;
+int active;
 } Port;
 
 static void enqueue_frame(Port *target, SharedFrame *frame)
 {
+    if (!target->active) 
+        return;
+
     if (frame_queue_try_push(&target->output, frame) == 0) {
         atomic_fetch_add(&target->dropped, 1);
     }
@@ -64,7 +75,7 @@ static void flood_frame(Port *source, SharedFrame *frame)
     }
 }
 
-static int forward_frame(Port *source, SharedFrame *frame)
+static int forward_frame_locked(Port *source, SharedFrame *frame)
 {
     int ingress = (int)(source - source->ports);
     int destination;
@@ -88,6 +99,21 @@ static int forward_frame(Port *source, SharedFrame *frame)
         enqueue_frame(&source->ports[destination], frame);
 
     return 0;
+}
+
+static int forward_frame(Port *source, SharedFrame *frame)
+{
+    if (pthread_mutex_lock(source->ports_lock) != 0) {
+        return -1;
+    }
+
+    int result = forward_frame_locked(source, frame);
+
+    if (pthread_mutex_unlock(source->ports_lock) != 0) {
+        return -1;
+    }
+
+    return result;
 }
 
 static void *receiver_thread(void *arg)
@@ -219,92 +245,256 @@ static void *mac_aging_worker(void *arg)
     return NULL;
 }
 
+static void stop_port_io(int fd)
+{
+    if (shutdown(fd, SHUT_RDWR) == -1 && errno != ENOTCONN) {
+        perror("shutdown client");
+    }
+}
+
+static void *port_session(void *arg)
+{
+    Port *port = arg;
+    pthread_t sender;
+
+    int error = pthread_create(&sender, NULL, sender_thread, port);
+    if (error == 0) {
+        receiver_thread(port);
+    } else {
+        fprintf(stderr, "pthread_create sender: %s\n", strerror(error));
+        port->receive_status = EXIT_FAILURE;
+    }
+
+    check_aging_thread(pthread_mutex_lock(port->ports_lock), "ports lock");
+    port->active = 0;
+    check_aging_thread(pthread_mutex_unlock(port->ports_lock), "ports unlock");
+
+    frame_queue_close(&port->output);
+    stop_port_io(port->fd);
+
+    if (error == 0) {
+        join_worker(sender);
+    }
+
+    check_aging_thread(pthread_mutex_lock(port->ports_lock), "ports lock");
+
+    if (mac_table_remove_port(port->mac_table,
+                              (int)(port - port->ports)) < 0) {
+        fprintf(stderr, "Could not remove disconnected port's MAC entries\n");
+        exit(EXIT_FAILURE);
+    }
+
+    frame_queue_destroy(&port->output);
+
+    if (close(port->fd) == -1) {
+        perror("close client");
+    }
+    port->fd = -1;
+
+    check_aging_thread(pthread_mutex_unlock(port->ports_lock), "ports unlock");
+
+    if (sem_post(port->free_ports) == -1) {
+        perror("sem_post");
+        exit(EXIT_FAILURE);
+    }
+
+    return NULL;
+}
+
+/* Returns 1 for a permit, 0 for timeout, or -1 on error. */
+static int wait_for_port(sem_t *free_ports)
+{
+    struct timespec deadline;
+
+    if (clock_gettime(CLOCK_REALTIME, &deadline) == -1) {
+        return -1;
+    }
+    deadline.tv_sec += PORT_WAIT_SECONDS;
+
+    int result;
+    do {
+        result = sem_timedwait(free_ports, &deadline);
+    } while (result == -1 && errno == EINTR);
+
+    if (result == 0) {
+        return 1;
+    }
+
+    return errno == ETIMEDOUT ? 0 : -1;
+}
+
 static int serve_hosts(int listener, int num_ports, MacTable *mac_table)
 {
-    Port ports[MAX_TEST_PORTS];
-    pthread_t receivers[MAX_TEST_PORTS];
-    pthread_t senders[MAX_TEST_PORTS];
-    int accepted = 0;
-    int receivers_started = 0;
-    int senders_started = 0;
+    Port ports[MAX_TEST_PORTS] = {0};
+    pthread_t sessions[MAX_TEST_PORTS];
+    int session_started[MAX_TEST_PORTS] = {0};
+    pthread_mutex_t ports_lock = PTHREAD_MUTEX_INITIALIZER;
+    sem_t free_ports;
     int status = EXIT_SUCCESS;
-    const struct timeval send_timeout = {.tv_sec = 2};
-    while (accepted < num_ports) {
-        int fd;
-        do {
-            fd = accept(listener, NULL, NULL);
-        } while (fd == -1 && errno == EINTR);
+
+    if (sem_init(&free_ports, 0, (unsigned int)num_ports) == -1) {
+        perror("sem_init");
+        check_aging_thread(pthread_mutex_destroy(&ports_lock), "ports destroy");
+        return EXIT_FAILURE;
+    }
+
+    for (int i = 0; i < num_ports; i++) {
+        ports[i].fd = -1;
+        ports[i].num_ports = num_ports;
+        ports[i].ports = ports;
+        ports[i].ports_lock = &ports_lock;
+        ports[i].free_ports = &free_ports;
+        ports[i].mac_table = mac_table;
+        atomic_init(&ports[i].dropped, 0);
+    }
+
+    struct pollfd listener_poll = {.fd = listener, .events = POLLIN};
+
+    for (;;) {
+        sigset_t pending;
+        if (sigpending(&pending) == -1) {
+            perror("sigpending");
+            status = EXIT_FAILURE;
+            break;
+        }
+        if (sigismember(&pending, SIGINT) == 1) {
+            break;
+        }
+
+        int ready = poll(&listener_poll, 1, 200);
+        if (ready == 0 || (ready == -1 && errno == EINTR)) {
+            continue;
+        }
+        if (ready == -1) {
+            perror("poll");
+            status = EXIT_FAILURE;
+            break;
+        }
+        if ((listener_poll.revents & POLLIN) == 0) {
+            fprintf(stderr, "Listener stopped accepting connections\n");
+            status = EXIT_FAILURE;
+            break;
+        }
+
+        int fd = accept(listener, NULL, NULL);
         if (fd == -1) {
+            if (errno == EINTR) {
+                continue;
+            }
             perror("accept");
             status = EXIT_FAILURE;
             break;
         }
-        Port *port = &ports[accepted];
-        port->fd = fd;
-        port->receive_status = EXIT_SUCCESS;
-        port->ports = ports;
-        port->num_ports = num_ports;
-        port->mac_table = mac_table;
-        atomic_init(&port->dropped, 0);
-        frame_queue_init(&port->output);
-        accepted++;
+
+        int admitted = wait_for_port(&free_ports);
+        if (admitted != 1) {
+            if (admitted == 0) {
+                const char reply[] = "switch full";
+                if (write_full(fd, reply, sizeof(reply) - 1) != 0) {
+                    perror("write switch full");
+                }
+            } else {
+                perror("sem_timedwait");
+                status = EXIT_FAILURE;
+            }
+
+            if (close(fd) == -1) {
+                perror("close pending client");
+            }
+            if (admitted < 0) {
+                break;
+            }
+            continue;
+        }
+
+        check_aging_thread(pthread_mutex_lock(&ports_lock), "ports lock");
+
+        int slot = 0;
+        while (slot < num_ports && ports[slot].fd != -1) {
+            slot++;
+        }
+
+        check_aging_thread(pthread_mutex_unlock(&ports_lock), "ports unlock");
+
+        if (slot == num_ports) {
+            fprintf(stderr, "Free-port semaphore and slots disagree\n");
+            if (close(fd) == -1) {
+                perror("close pending client");
+            }
+            status = EXIT_FAILURE;
+            break;
+        }
+
+        if (session_started[slot]) {
+            join_worker(sessions[slot]);
+            session_started[slot] = 0;
+        }
+
+        const struct timeval send_timeout = {.tv_sec = 2};
         if (setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO,
                        &send_timeout, sizeof(send_timeout)) == -1) {
             perror("setsockopt SO_SNDTIMEO");
-            status = EXIT_FAILURE;
-            break;
-        }
-    }
-    while (status == EXIT_SUCCESS && senders_started < accepted) {
-        int i = senders_started;
-        int error = pthread_create(&senders[i], NULL, sender_thread,
-                                   &ports[i]);
-        if (error != 0) {
-            fprintf(stderr, "pthread_create sender: %s\n", strerror(error));
-            status = EXIT_FAILURE;
-            break;
-        }
-        senders_started++;
-    }
-    while (status == EXIT_SUCCESS && receivers_started < accepted) {
-        int i = receivers_started;
-        int error = pthread_create(&receivers[i], NULL, receiver_thread,
-                                   &ports[i]);
-        if (error != 0) {
-            fprintf(stderr, "pthread_create receiver: %s\n", strerror(error));
-            status = EXIT_FAILURE;
-            break;
-        }
-        receivers_started++;
-    }
-    if (status == EXIT_FAILURE) {
-        for (int i = 0; i < accepted; i++) {
-            if (shutdown(ports[i].fd, SHUT_RDWR) == -1 && errno != ENOTCONN) {
-                perror("shutdown client");
+            if (close(fd) == -1) {
+                perror("close client");
             }
-        }
-    }
-    for (int i = 0; i < receivers_started; i++) {
-        join_worker(receivers[i]);
-        if (ports[i].receive_status != EXIT_SUCCESS) {
             status = EXIT_FAILURE;
+            break;
+        }
+
+        Port *port = &ports[slot];
+        check_aging_thread(pthread_mutex_lock(&ports_lock), "ports lock");
+
+        port->fd = fd;
+        port->receive_status = EXIT_SUCCESS;
+        frame_queue_init(&port->output);
+        port->active = 1;
+
+        int error = pthread_create(&sessions[slot], NULL, port_session, port);
+        if (error != 0) {
+            fprintf(stderr, "pthread_create session: %s\n", strerror(error));
+            port->active = 0;
+            frame_queue_destroy(&port->output);
+            if (close(fd) == -1) {
+                perror("close client");
+            }
+            port->fd = -1;
+            status = EXIT_FAILURE;
+        } else {
+            session_started[slot] = 1;
+        }
+
+        check_aging_thread(pthread_mutex_unlock(&ports_lock), "ports unlock");
+
+        if (status != EXIT_SUCCESS) {
+            break;
         }
     }
-    for (int i = 0; i < accepted; i++) {
-        frame_queue_close(&ports[i].output);
+
+    check_aging_thread(pthread_mutex_lock(&ports_lock), "ports lock");
+
+    for (int i = 0; i < num_ports; i++) {
+        if (ports[i].fd != -1) {
+            ports[i].active = 0;
+            stop_port_io(ports[i].fd);
+        }
     }
-    for (int i = 0; i < senders_started; i++) {
-        join_worker(senders[i]);
-    }
-    for (int i = 0; i < accepted; i++) {
+
+    check_aging_thread(pthread_mutex_unlock(&ports_lock), "ports unlock");
+
+    for (int i = 0; i < num_ports; i++) {
+        if (session_started[i]) {
+            join_worker(sessions[i]);
+        }
         printf("Port %d: %u dropped deliveries\n",
                i + 1, atomic_load(&ports[i].dropped));
-        frame_queue_destroy(&ports[i].output);
-        if (close(ports[i].fd) == -1) {
-            perror("close client");
-            status = EXIT_FAILURE;
-        }
     }
+
+    if (sem_destroy(&free_ports) == -1) {
+        perror("sem_destroy");
+        status = EXIT_FAILURE;
+    }
+
+    check_aging_thread(pthread_mutex_destroy(&ports_lock), "ports destroy");
     return status;
 }
 
@@ -358,6 +548,19 @@ int main(int argc, char *argv[])
         goto close_listener;
     }
 
+    sigset_t stop_signals;
+    if (sigemptyset(&stop_signals) == -1 ||
+        sigaddset(&stop_signals, SIGINT) == -1) {
+        perror("configure SIGINT");
+        return EXIT_FAILURE;
+    }
+
+    int signal_error = pthread_sigmask(SIG_BLOCK, &stop_signals, NULL);
+    if (signal_error != 0) {
+        fprintf(stderr, "pthread_sigmask: %s\n", strerror(signal_error));
+        return EXIT_FAILURE;
+    }
+
     MacAging aging = {
         .table = &mac_table,
         .mutex = PTHREAD_MUTEX_INITIALIZER,
@@ -383,12 +586,11 @@ int main(int argc, char *argv[])
         }
     }
 
-    check_aging_thread(pthread_cond_destroy(&aging.wake),
-                       "aging condition destroy");
-    check_aging_thread(pthread_mutex_destroy(&aging.mutex),
-                       "aging mutex destroy");
+    check_aging_thread(pthread_cond_destroy(&aging.wake), "aging condition destroy");
+    check_aging_thread(pthread_mutex_destroy(&aging.mutex), "aging mutex destroy");
 
-    if (mac_table_destroy(&mac_table) != 0) {
+    if (mac_table_destroy(&mac_table) != 0) 
+    {
         fprintf(stderr, "Could not destroy MAC table\n");
         status = EXIT_FAILURE;
     }

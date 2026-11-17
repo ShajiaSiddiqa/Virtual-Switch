@@ -331,3 +331,47 @@ int mac_table_expire(MacTable *table, unsigned int max_age_seconds)
 
     return removed;
 }
+
+int mac_table_remove_port(MacTable *table, int port)
+{
+    if (table == NULL || port < 0 ||
+        pthread_mutex_lock(&table->capacity_lock) != 0) {
+        return -1;
+    }
+
+    int removed = 0;
+
+    for (size_t i = 0; i < MAC_TABLE_BUCKETS; i++) {
+        MacBucket *bucket = &table->buckets[i];
+
+        if (pthread_mutex_lock(&bucket->lock) != 0) {
+            removed = -1;
+            break;
+        }
+
+        MacEntry **link = &bucket->head;
+        while (*link != NULL) {
+            MacEntry *entry = *link;
+
+            if (entry->port == port) {
+                *link = entry->next;
+                free(entry);
+                table->entry_count--;
+                removed++;
+            } else {
+                link = &entry->next;
+            }
+        }
+
+        if (pthread_mutex_unlock(&bucket->lock) != 0) {
+            removed = -1;
+            break;
+        }
+    }
+
+    if (pthread_mutex_unlock(&table->capacity_lock) != 0) {
+        return -1;
+    }
+
+    return removed;
+}

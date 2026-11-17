@@ -52,7 +52,10 @@ int mac_table_lookup(MacTable *table, const uint8_t mac[FRAME_MAC_SIZE], int *po
 // Learn a MAC address or update its port if it has moved. Returns 0 on success or -1 on error.
 int mac_table_insert(MacTable *table, const uint8_t mac[FRAME_MAC_SIZE], int port);
 
-/* Returns the number removed, or -1 on error. */
+// Returns the number removed, or -1 on error. 
 int mac_table_expire(MacTable *table, unsigned int max_age_seconds);
+
+// Remove mappings for a disconnected port. Returns a count or -1. 
+int mac_table_remove_port(MacTable *table, int port);
 
 #endif
