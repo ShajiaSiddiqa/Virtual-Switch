@@ -163,8 +163,24 @@ static int replace_oldest(MacTable *table, size_t target_index,  MacEntry *repla
 
     return result;
 }
-int mac_table_insert(MacTable *table, const uint8_t mac[FRAME_MAC_SIZE],
-                     int port)
+
+static size_t count_port_entries(const MacTable *table, int port)
+{
+    size_t count = 0;
+
+    for (size_t i = 0; i < MAC_TABLE_BUCKETS; i++) {
+        for (const MacEntry *entry = table->buckets[i].head;
+             entry != NULL; entry = entry->next) {
+            if (entry->port == port) {
+                count++;
+            }
+        }
+    }
+
+    return count;
+}
+
+int mac_table_insert(MacTable *table, const uint8_t mac[FRAME_MAC_SIZE],int port)
 {
     if (table == NULL || mac == NULL || port < 0) {
         return -1;
@@ -190,6 +206,12 @@ int mac_table_insert(MacTable *table, const uint8_t mac[FRAME_MAC_SIZE],
     }
 
     MacEntry *entry = find_entry(bucket, mac);
+    if ((entry == NULL || entry->port != port) && count_port_entries(table, port) >= MAC_TABLE_PORT_LIMIT) {
+        pthread_mutex_unlock(&bucket->lock);
+        pthread_mutex_unlock(&table->capacity_lock);
+        return MAC_TABLE_PORT_LIMIT_REACHED;
+    }
+
     if (entry != NULL) {
         int old_port = entry->port;
         entry->port = port;

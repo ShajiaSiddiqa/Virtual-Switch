@@ -69,27 +69,23 @@ static int forward_frame(Port *source, SharedFrame *frame)
     int ingress = (int)(source - source->ports);
     int destination;
 
-    if (mac_table_insert(source->mac_table, frame->header.src, ingress) != 0) {
-        return -1;
-    }
+    int learned = mac_table_insert(source->mac_table, frame->header.src, ingress);
+    if (learned != 0) 
+        return learned;
 
-    /* Broadcast and multicast destinations are group addresses. */
     if ((frame->header.dst[0] & 1u) != 0) {
         flood_frame(source, frame);
         return 0;
     }
 
-    int found = mac_table_lookup(source->mac_table, frame->header.dst,
-                                 &destination);
-    if (found < 0) {
+    int found = mac_table_lookup(source->mac_table, frame->header.dst, &destination);
+    if (found < 0) 
         return -1;
-    }
 
-    if (found == 0) {
+    if (found == 0) 
         flood_frame(source, frame);
-    } else if (destination != ingress) {
+    else if (destination != ingress) 
         enqueue_frame(&source->ports[destination], frame);
-    }
 
     return 0;
 }
@@ -117,6 +113,19 @@ static void *receiver_thread(void *arg)
         }
         int forward_result = forward_frame(port, frame);
         shared_frame_release(frame);
+        if (forward_result == MAC_TABLE_PORT_LIMIT_REACHED) {
+            int port_number = (int)(port - port->ports) + 1;
+            fprintf(stderr, "Port %d shut down: MAC limit exceeded\n", port_number);
+
+            frame_queue_close(&port->output);
+
+            if (shutdown(port->fd, SHUT_RDWR) == -1 && errno != ENOTCONN) {
+                perror("shutdown client");
+                port->receive_status = EXIT_FAILURE;
+            }
+
+            return NULL;
+        }
         if (forward_result != 0) {
             fprintf(stderr, "MAC table operation failed\n");
             port->receive_status = EXIT_FAILURE;

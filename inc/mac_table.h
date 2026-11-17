@@ -13,6 +13,13 @@
 #define MAC_TABLE_CAPACITY 256
 #endif
 
+#ifndef MAC_TABLE_PORT_LIMIT
+#define MAC_TABLE_PORT_LIMIT 4
+#endif
+
+#define MAC_TABLE_PORT_LIMIT_REACHED 1
+
+
 typedef struct MacEntry {
     uint8_t mac[FRAME_MAC_SIZE];
     int port;
