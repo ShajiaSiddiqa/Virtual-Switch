@@ -1,19 +1,31 @@
+#define _POSIX_C_SOURCE 200809L
 #include "frame_io.h"
 #include "frame_queue.h"
 #include "mac_table.h"
-#include <stdatomic.h>
-#include <sys/time.h>
-#include <arpa/inet.h>
+#include <time.h>
 #include <errno.h>
 #include <stdio.h>
+#include <signal.h>
+#include <string.h>
 #include <stdlib.h>
-#include <sys/socket.h>
 #include <unistd.h>
 #include <pthread.h>
-#include <string.h>
-#include <signal.h>
+#include <sys/time.h>
+#include <stdatomic.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
 
 #define MAX_TEST_PORTS 64
+#define MAC_AGE_SECONDS 5
+#define MAC_SWEEP_SECONDS 1
+
+typedef struct {
+    MacTable *table;
+    pthread_mutex_t mutex;
+    pthread_cond_t wake;
+    int stop;
+    int failed;
+} MacAging;
 
 static int parse_number(const char *text, long max)
 {
@@ -144,6 +156,60 @@ static void join_worker(pthread_t thread)
     }
 }
 
+static void check_aging_thread(int error, const char *operation)
+{
+    if (error != 0) {
+        fprintf(stderr, "%s: %s\n", operation, strerror(error));
+        exit(EXIT_FAILURE);
+    }
+}
+
+static void *mac_aging_worker(void *arg)
+{
+    MacAging *aging = arg;
+
+    check_aging_thread(pthread_mutex_lock(&aging->mutex), "aging lock");
+
+    while (!aging->stop) {
+        struct timespec deadline;
+
+        if (clock_gettime(CLOCK_REALTIME, &deadline) == -1) {
+            perror("clock_gettime");
+            aging->failed = 1;
+            break;
+        }
+        deadline.tv_sec += MAC_SWEEP_SECONDS;
+
+        int result = 0;
+        while (!aging->stop && result == 0) {
+            result = pthread_cond_timedwait(&aging->wake, &aging->mutex,
+                                            &deadline);
+        }
+
+        if (result != 0 && result != ETIMEDOUT) {
+            fprintf(stderr, "aging wait: %s\n", strerror(result));
+            aging->failed = 1;
+            break;
+        }
+        if (aging->stop) {
+            break;
+        }
+
+        check_aging_thread(pthread_mutex_unlock(&aging->mutex), "aging unlock");
+        int removed = mac_table_expire(aging->table, MAC_AGE_SECONDS);
+        check_aging_thread(pthread_mutex_lock(&aging->mutex), "aging lock");
+
+        if (removed < 0) {
+            fprintf(stderr, "MAC aging sweep failed\n");
+            aging->failed = 1;
+            break;
+        }
+    }
+
+    check_aging_thread(pthread_mutex_unlock(&aging->mutex), "aging unlock");
+    return NULL;
+}
+
 static int serve_hosts(int listener, int num_ports, MacTable *mac_table)
 {
     Port ports[MAX_TEST_PORTS];
@@ -239,42 +305,80 @@ int main(int argc, char *argv[])
         fprintf(stderr, "Usage: %s <tcp_port> <num_ports>\n", argv[0]);
         return EXIT_FAILURE;
     }
+
     int port = parse_number(argv[1], 65535);
     int num_ports = parse_number(argv[2], MAX_TEST_PORTS);
+
     if (port == -1 || num_ports == -1) {
-        fprintf(stderr, "Use TCP port 1-65535 and num_ports 1-%d.\n", MAX_TEST_PORTS);
+        fprintf(stderr, "Use TCP port 1-65535 and num_ports 1-%d.\n",
+                MAX_TEST_PORTS);
         return EXIT_FAILURE;
     }
+
     if (signal(SIGPIPE, SIG_IGN) == SIG_ERR) {
         perror("signal");
         return EXIT_FAILURE;
     }
+
     int listener = socket(AF_INET, SOCK_STREAM, 0);
     if (listener == -1) {
         perror("socket");
         return EXIT_FAILURE;
     }
+
     int status = EXIT_FAILURE;
     struct sockaddr_in address = {
         .sin_family = AF_INET,
         .sin_port = htons((uint16_t)port),
         .sin_addr.s_addr = htonl(INADDR_ANY)
     };
+
     if (bind(listener, (struct sockaddr *)&address, sizeof(address)) == -1) {
         perror("bind");
         goto close_listener;
     }
+
     if (listen(listener, num_ports) == -1) {
         perror("listen");
         goto close_listener;
     }
+
     MacTable mac_table;
     if (mac_table_init(&mac_table) != 0) {
         fprintf(stderr, "Could not initialize MAC table\n");
         goto close_listener;
     }
 
-    status = serve_hosts(listener, num_ports, &mac_table);
+    MacAging aging = {
+        .table = &mac_table,
+        .mutex = PTHREAD_MUTEX_INITIALIZER,
+        .wake = PTHREAD_COND_INITIALIZER
+    };
+    pthread_t aging_thread;
+
+    int error = pthread_create(&aging_thread, NULL, mac_aging_worker, &aging);
+    if (error != 0) {
+        fprintf(stderr, "pthread_create MAC aging: %s\n", strerror(error));
+        status = EXIT_FAILURE;
+    } else {
+        status = serve_hosts(listener, num_ports, &mac_table);
+
+        check_aging_thread(pthread_mutex_lock(&aging.mutex), "aging lock");
+        aging.stop = 1;
+        check_aging_thread(pthread_cond_signal(&aging.wake), "aging signal");
+        check_aging_thread(pthread_mutex_unlock(&aging.mutex), "aging unlock");
+
+        join_worker(aging_thread);
+        if (aging.failed) {
+            status = EXIT_FAILURE;
+        }
+    }
+
+    check_aging_thread(pthread_cond_destroy(&aging.wake),
+                       "aging condition destroy");
+    check_aging_thread(pthread_mutex_destroy(&aging.mutex),
+                       "aging mutex destroy");
+
     if (mac_table_destroy(&mac_table) != 0) {
         fprintf(stderr, "Could not destroy MAC table\n");
         status = EXIT_FAILURE;
@@ -285,5 +389,6 @@ close_listener:
         perror("close listener");
         status = EXIT_FAILURE;
     }
+
     return status;
 }
