@@ -3,6 +3,7 @@
 #include "control.h"
 #include "frame_io.h"
 #include "mac_table.h"
+#include "shm_stats.h"
 #include "frame_queue.h"
 #include <poll.h>
 #include <time.h>
@@ -48,6 +49,7 @@ typedef struct Port {
     int num_ports;
     sem_t *free_ports;
     FrameQueue output;
+    StatsHandle *stats;
     struct Port *ports;
     int receive_status;
     atomic_uint dropped;
@@ -55,6 +57,16 @@ typedef struct Port {
     pthread_mutex_t *ports_lock;
 int active;
 } Port;
+
+static void record_stats(Port *port, StatsCounter counter)
+{
+    size_t index = (size_t)(port - port->ports);
+
+    if (shm_stats_add(port->stats, index, counter) == -1) {
+        perror("shm_stats_add");
+        exit(EXIT_FAILURE);
+    }
+}
 
 typedef struct {
     Port *ports;
@@ -175,8 +187,10 @@ static void enqueue_frame(Port *target, SharedFrame *frame)
     if (!target->active) 
         return;
 
-    if (frame_queue_try_push(&target->output, frame) == 0) 
-        atomic_fetch_add(&target->dropped, 1);
+    if (frame_queue_try_push(&target->output, frame) == 0) {
+        atomic_fetch_add(&target->dropped, 1); 
+        record_stats(target, STATS_FRAMES_DROPPED);
+    }
 }
 
 static void flood_frame(Port *source, SharedFrame *frame)
@@ -243,6 +257,8 @@ static void *receiver_thread(void *arg)
             port->receive_status = EXIT_FAILURE;
             return NULL;
         }
+        record_stats(port, STATS_FRAMES_IN);
+
         SharedFrame *frame = shared_frame_create(&header, payload);
         if (frame == NULL) {
             perror("shared_frame_create");
@@ -276,21 +292,30 @@ static void *sender_thread(void *arg)
 {
     Port *port = arg;
     SharedFrame *frame;
+
     while (frame_queue_pop(&port->output, &frame) == 1) {
         int result = frame_write(port->fd, &frame->header, frame->payload);
         int write_error = errno;
+
         shared_frame_release(frame);
-        if (result != 0) {
-            errno = write_error;
-            perror("frame_write");
-            frame_queue_close(&port->output);
-            if (shutdown(port->fd, SHUT_RDWR) == -1 &&
-                errno != ENOTCONN) {
-                perror("shutdown client");
-            }
-            break;
+
+        if (result == 0) {
+            record_stats(port, STATS_FRAMES_OUT);
+            continue;
         }
+
+        errno = write_error;
+        perror("frame_write");
+        frame_queue_close(&port->output);
+
+        if (shutdown(port->fd, SHUT_RDWR) == -1 &&
+            errno != ENOTCONN) {
+            perror("shutdown client");
+        }
+
+        break;
     }
+
     return NULL;
 }
 
@@ -431,7 +456,7 @@ static int wait_for_port(sem_t *free_ports)
     return errno == ETIMEDOUT ? 0 : -1;
 }
 
-static int serve_hosts(int listener, int num_ports, MacTable *mac_table)
+static int serve_hosts(int listener, int num_ports, MacTable *mac_table, StatsHandle *stats)
 {
     Port ports[MAX_TEST_PORTS] = {0};
     pthread_t sessions[MAX_TEST_PORTS];
@@ -448,11 +473,12 @@ static int serve_hosts(int listener, int num_ports, MacTable *mac_table)
 
     for (int i = 0; i < num_ports; i++) {
         ports[i].fd = -1;
-        ports[i].num_ports = num_ports;
         ports[i].ports = ports;
-        ports[i].ports_lock = &ports_lock;
-        ports[i].free_ports = &free_ports;
+        ports[i].stats = stats;
+        ports[i].num_ports = num_ports;
         ports[i].mac_table = mac_table;
+        ports[i].free_ports = &free_ports;
+        ports[i].ports_lock = &ports_lock;
         atomic_init(&ports[i].dropped, 0);
     }
 
@@ -673,6 +699,18 @@ int main(int argc, char *argv[])
         fprintf(stderr, "Could not initialize MAC table\n");
         goto close_listener;
     }
+    StatsHandle stats;
+
+    if (shm_stats_create(&stats, (size_t)num_ports) == -1) {
+        perror("shm_stats_create");
+
+        if (mac_table_destroy(&mac_table) != 0) {
+            fprintf(stderr, "Could not destroy MAC table\n");
+        }
+
+        goto close_listener;
+    }
+
 
     sigset_t stop_signals;
     if (sigemptyset(&stop_signals) == -1 ||
@@ -699,8 +737,7 @@ int main(int argc, char *argv[])
         fprintf(stderr, "pthread_create MAC aging: %s\n", strerror(error));
         status = EXIT_FAILURE;
     } else {
-        status = serve_hosts(listener, num_ports, &mac_table);
-
+        status = serve_hosts(listener, num_ports, &mac_table, &stats);
         check_aging_thread(pthread_mutex_lock(&aging.mutex), "aging lock");
         aging.stop = 1;
         check_aging_thread(pthread_cond_signal(&aging.wake), "aging signal");
@@ -718,6 +755,11 @@ int main(int argc, char *argv[])
     if (mac_table_destroy(&mac_table) != 0) 
     {
         fprintf(stderr, "Could not destroy MAC table\n");
+        status = EXIT_FAILURE;
+    }
+
+    if (shm_stats_close(&stats) == -1) {
+        perror("shm_stats_close");
         status = EXIT_FAILURE;
     }
 
