@@ -4,6 +4,7 @@
 #include <stdio.h>  
 #include <stdlib.h>  
 #include <string.h>  
+#include <errno.h>
 
 static size_t bucket_index(const uint8_t mac[FRAME_MAC_SIZE])
 {
@@ -374,4 +375,120 @@ int mac_table_remove_port(MacTable *table, int port)
     }
 
     return removed;
+}
+
+static int unlock_table(MacTable *table)
+{
+    int first_error = 0;
+
+    for (size_t i = MAC_TABLE_BUCKETS; i > 0; i--) {
+        int error = pthread_mutex_unlock(&table->buckets[i - 1].lock);
+        if (first_error == 0) {
+            first_error = error;
+        }
+    }
+
+    int error = pthread_mutex_unlock(&table->capacity_lock);
+    if (first_error == 0) 
+        first_error = error;
+
+    if (first_error != 0) {
+        errno = first_error;
+        return -1;
+    }
+
+    return 0;
+}
+
+static int lock_table(MacTable *table)
+{
+    int error = pthread_mutex_lock(&table->capacity_lock);
+    if (error != 0) {
+        errno = error;
+        return -1;
+    }
+
+    size_t locked = 0;
+
+    while (locked < MAC_TABLE_BUCKETS) {
+        error = pthread_mutex_lock(&table->buckets[locked].lock);
+
+        if (error != 0) {
+            while (locked > 0) {
+                int cleanup = pthread_mutex_unlock(
+                    &table->buckets[--locked].lock);
+                if (cleanup != 0) {
+                    abort();
+                }
+            }
+
+            int cleanup = pthread_mutex_unlock(&table->capacity_lock);
+            if (cleanup != 0) 
+                abort();
+
+            errno = error;
+            return -1;
+        }
+
+        locked++;
+    }
+
+    return 0;
+}
+
+int mac_table_snapshot(MacTable *table, MacRecord *records, size_t capacity, size_t *count)
+{
+    if (table == NULL || records == NULL || count == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    if (lock_table(table) == -1) 
+        return -1;
+
+    if (capacity < table->entry_count) {
+        if (unlock_table(table) == -1) 
+            return -1;
+
+        errno = ENOSPC;
+        return -1;
+    }
+
+    size_t used = 0;
+
+    for (size_t i = 0; i < MAC_TABLE_BUCKETS; i++) {
+        for (MacEntry *entry = table->buckets[i].head;  entry != NULL; entry = entry->next) {
+            memcpy(records[used].mac, entry->mac, FRAME_MAC_SIZE);
+            records[used].port = entry->port;
+            used++;
+        }
+    }
+
+    *count = used;
+    return unlock_table(table);
+}
+
+int mac_table_clear(MacTable *table)
+{
+    if (table == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    if (lock_table(table) == -1) 
+        return -1;
+
+    for (size_t i = 0; i < MAC_TABLE_BUCKETS; i++) {
+        MacEntry *entry = table->buckets[i].head;
+        table->buckets[i].head = NULL;
+
+        while (entry != NULL) {
+            MacEntry *next = entry->next;
+            free(entry);
+            entry = next;
+        }
+    }
+
+    table->entry_count = 0;
+    return unlock_table(table);
 }

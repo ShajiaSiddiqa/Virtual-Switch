@@ -40,6 +40,11 @@ typedef struct {
     size_t entry_count;
 } MacTable;
 
+typedef struct {
+    uint8_t mac[FRAME_MAC_SIZE];
+    int port;
+} MacRecord;
+
 // Initialize an empty table before any threads use it. Returns 0 on success or -1 on error. 
 int mac_table_init(MacTable *table);
 
@@ -57,5 +62,9 @@ int mac_table_expire(MacTable *table, unsigned int max_age_seconds);
 
 // Remove mappings for a disconnected port. Returns a count or -1. 
 int mac_table_remove_port(MacTable *table, int port);
+
+int mac_table_snapshot(MacTable *table, MacRecord *records, size_t capacity, size_t *count);
+
+int mac_table_clear(MacTable *table);
 
 #endif
