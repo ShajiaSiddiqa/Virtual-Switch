@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include "io.h"
+#include "control.h"
 #include "frame_io.h"
 #include "mac_table.h"
 #include "frame_queue.h"
@@ -55,14 +56,127 @@ typedef struct Port {
 int active;
 } Port;
 
+typedef struct {
+    Port *ports;
+    int num_ports;
+    pthread_mutex_t *ports_lock;
+    MacTable *mac_table;
+} AdminContext;
+
+static int admin_message(char *response, size_t capacity,  const char *message, int result)
+{
+    int length = snprintf(response, capacity, "%s", message);
+
+    if (length < 0 || (size_t)length >= capacity) 
+        return -1;
+
+    return result;
+}
+
+static int show_mac(MacTable *table, char *response, size_t capacity)
+{
+    MacRecord records[MAC_TABLE_CAPACITY];
+    size_t count;
+
+    if (mac_table_snapshot(table, records, MAC_TABLE_CAPACITY, &count) != 0) 
+        return admin_message(response, capacity, "MAC snapshot failed\n", -1);
+
+
+    int length = snprintf(response, capacity, "MAC                PORT\n");
+    if (length < 0 || (size_t)length >= capacity) 
+        return -1;
+
+    size_t used = (size_t)length;
+
+    for (size_t i = 0; i < count; i++) {
+        const uint8_t *mac = records[i].mac;
+
+        length = snprintf(response + used, capacity - used,
+                          "%02x:%02x:%02x:%02x:%02x:%02x  %d\n",
+                          (unsigned)mac[0], (unsigned)mac[1],
+                          (unsigned)mac[2], (unsigned)mac[3],
+                          (unsigned)mac[4], (unsigned)mac[5],
+                          records[i].port + 1);
+
+        if (length < 0 || (size_t)length >= capacity - used) 
+            return admin_message(response, capacity, "Response too large\n", -1);
+
+        used += (size_t)length;
+    }
+
+    return 0;
+}
+
+static int show_ports(AdminContext *admin, char *response, size_t capacity)
+{
+    int states[MAX_TEST_PORTS];
+
+    int error = pthread_mutex_lock(admin->ports_lock);
+    if (error != 0) 
+        return admin_message(response, capacity, "Port lock failed\n", -1);
+
+    for (int i = 0; i < admin->num_ports; i++) {
+        states[i] = admin->ports[i].fd == -1 ? 0 :
+                    (admin->ports[i].active ? 1 : 2);
+    }
+
+    error = pthread_mutex_unlock(admin->ports_lock);
+    if (error != 0) 
+        return admin_message(response, capacity, "Port unlock failed\n", -1);
+
+    int length = snprintf(response, capacity, "PORT  STATE\n");
+    if (length < 0 || (size_t)length >= capacity) 
+        return -1;
+
+    size_t used = (size_t)length;
+    const char *names[] = {"FREE", "ACTIVE", "CLOSING"};
+
+    for (int i = 0; i < admin->num_ports; i++) {
+        length = snprintf(response + used, capacity - used, "%d  %s\n", i + 1, names[states[i]]);
+
+        if (length < 0 || (size_t)length >= capacity - used) 
+            return admin_message(response, capacity, "Response too large\n", -1);
+
+        used += (size_t)length;
+    }
+
+    return 0;
+}
+
+static int handle_admin(const char *command, char *response, size_t capacity, void *context)
+{
+    AdminContext *admin = context;
+
+    if (strcmp(command, "show mac") == 0) 
+        return show_mac(admin->mac_table, response, capacity);
+
+    if (strcmp(command, "show ports") == 0) 
+        return show_ports(admin, response, capacity);
+
+    if (strcmp(command, "clear mac") == 0) {
+        int error = pthread_mutex_lock(admin->ports_lock);
+        if (error != 0) 
+            return admin_message(response, capacity, "Port lock failed\n", -1);
+
+        int result = mac_table_clear(admin->mac_table);
+        error = pthread_mutex_unlock(admin->ports_lock);
+
+        if (result != 0 || error != 0) 
+            return admin_message(response, capacity, "MAC clear failed\n", -1);
+
+        return admin_message(response, capacity, "MAC table cleared\n", 0);
+    }
+
+    return admin_message(response, capacity, "Unknown command\n", -1);
+}
+
 static void enqueue_frame(Port *target, SharedFrame *frame)
 {
     if (!target->active) 
         return;
 
-    if (frame_queue_try_push(&target->output, frame) == 0) {
+    if (frame_queue_try_push(&target->output, frame) == 0) 
         atomic_fetch_add(&target->dropped, 1);
-    }
 }
 
 static void flood_frame(Port *source, SharedFrame *frame)
@@ -103,15 +217,13 @@ static int forward_frame_locked(Port *source, SharedFrame *frame)
 
 static int forward_frame(Port *source, SharedFrame *frame)
 {
-    if (pthread_mutex_lock(source->ports_lock) != 0) {
+    if (pthread_mutex_lock(source->ports_lock) != 0) 
         return -1;
-    }
 
     int result = forward_frame_locked(source, frame);
 
-    if (pthread_mutex_unlock(source->ports_lock) != 0) {
+    if (pthread_mutex_unlock(source->ports_lock) != 0) 
         return -1;
-    }
 
     return result;
 }
@@ -123,9 +235,9 @@ static void *receiver_thread(void *arg)
     uint8_t payload[FRAME_MAX_PAYLOAD];
     for (;;) {
         int result = frame_read(port->fd, &header, payload);
-        if (result == 0) {
+        if (result == 0) 
             return NULL;
-        }
+
         if (result < 0) {
             perror("frame_read");
             port->receive_status = EXIT_FAILURE;
@@ -217,8 +329,7 @@ static void *mac_aging_worker(void *arg)
 
         int result = 0;
         while (!aging->stop && result == 0) {
-            result = pthread_cond_timedwait(&aging->wake, &aging->mutex,
-                                            &deadline);
+            result = pthread_cond_timedwait(&aging->wake, &aging->mutex, &deadline);
         }
 
         if (result != 0 && result != ETIMEDOUT) {
@@ -226,9 +337,8 @@ static void *mac_aging_worker(void *arg)
             aging->failed = 1;
             break;
         }
-        if (aging->stop) {
+        if (aging->stop) 
             break;
-        }
 
         check_aging_thread(pthread_mutex_unlock(&aging->mutex), "aging unlock");
         int removed = mac_table_expire(aging->table, MAC_AGE_SECONDS);
@@ -278,8 +388,7 @@ static void *port_session(void *arg)
 
     check_aging_thread(pthread_mutex_lock(port->ports_lock), "ports lock");
 
-    if (mac_table_remove_port(port->mac_table,
-                              (int)(port - port->ports)) < 0) {
+    if (mac_table_remove_port(port->mac_table, (int)(port - port->ports)) < 0) {
         fprintf(stderr, "Could not remove disconnected port's MAC entries\n");
         exit(EXIT_FAILURE);
     }
@@ -301,7 +410,7 @@ static void *port_session(void *arg)
     return NULL;
 }
 
-/* Returns 1 for a permit, 0 for timeout, or -1 on error. */
+// Returns 1 for a permit, 0 for timeout, or -1 on error. 
 static int wait_for_port(sem_t *free_ports)
 {
     struct timespec deadline;
@@ -316,9 +425,8 @@ static int wait_for_port(sem_t *free_ports)
         result = sem_timedwait(free_ports, &deadline);
     } while (result == -1 && errno == EINTR);
 
-    if (result == 0) {
+    if (result == 0) 
         return 1;
-    }
 
     return errno == ETIMEDOUT ? 0 : -1;
 }
@@ -348,6 +456,25 @@ static int serve_hosts(int listener, int num_ports, MacTable *mac_table)
         atomic_init(&ports[i].dropped, 0);
     }
 
+    AdminContext admin = {
+        .ports = ports,
+        .num_ports = num_ports,
+        .ports_lock = &ports_lock,
+        .mac_table = mac_table
+    };
+
+    ControlServer control;
+
+    if (control_start(&control, handle_admin, &admin) == -1) {
+        perror("control_start");
+
+        if (sem_destroy(&free_ports) == -1) 
+            perror("sem_destroy");
+
+        check_aging_thread(pthread_mutex_destroy(&ports_lock), "ports destroy");
+        return EXIT_FAILURE;
+    }
+
     struct pollfd listener_poll = {.fd = listener, .events = POLLIN};
 
     for (;;) {
@@ -357,9 +484,8 @@ static int serve_hosts(int listener, int num_ports, MacTable *mac_table)
             status = EXIT_FAILURE;
             break;
         }
-        if (sigismember(&pending, SIGINT) == 1) {
+        if (sigismember(&pending, SIGINT) == 1) 
             break;
-        }
 
         int ready = poll(&listener_poll, 1, 200);
         if (ready == 0 || (ready == -1 && errno == EINTR)) {
@@ -398,12 +524,11 @@ static int serve_hosts(int listener, int num_ports, MacTable *mac_table)
                 status = EXIT_FAILURE;
             }
 
-            if (close(fd) == -1) {
+            if (close(fd) == -1) 
                 perror("close pending client");
-            }
-            if (admitted < 0) {
+            if (admitted < 0) 
                 break;
-            }
+
             continue;
         }
 
@@ -434,9 +559,8 @@ static int serve_hosts(int listener, int num_ports, MacTable *mac_table)
         if (setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO,
                        &send_timeout, sizeof(send_timeout)) == -1) {
             perror("setsockopt SO_SNDTIMEO");
-            if (close(fd) == -1) {
+            if (close(fd) == -1) 
                 perror("close client");
-            }
             status = EXIT_FAILURE;
             break;
         }
@@ -465,9 +589,13 @@ static int serve_hosts(int listener, int num_ports, MacTable *mac_table)
 
         check_aging_thread(pthread_mutex_unlock(&ports_lock), "ports unlock");
 
-        if (status != EXIT_SUCCESS) {
+        if (status != EXIT_SUCCESS) 
             break;
-        }
+    }
+
+    if (control_stop(&control) == -1) {
+        perror("control_stop");
+        exit(EXIT_FAILURE);
     }
 
     check_aging_thread(pthread_mutex_lock(&ports_lock), "ports lock");
@@ -482,11 +610,10 @@ static int serve_hosts(int listener, int num_ports, MacTable *mac_table)
     check_aging_thread(pthread_mutex_unlock(&ports_lock), "ports unlock");
 
     for (int i = 0; i < num_ports; i++) {
-        if (session_started[i]) {
+        if (session_started[i]) 
             join_worker(sessions[i]);
-        }
-        printf("Port %d: %u dropped deliveries\n",
-               i + 1, atomic_load(&ports[i].dropped));
+
+        printf("Port %d: %u dropped deliveries\n", i + 1, atomic_load(&ports[i].dropped));
     }
 
     if (sem_destroy(&free_ports) == -1) {
@@ -509,8 +636,7 @@ int main(int argc, char *argv[])
     int num_ports = parse_number(argv[2], MAX_TEST_PORTS);
 
     if (port == -1 || num_ports == -1) {
-        fprintf(stderr, "Use TCP port 1-65535 and num_ports 1-%d.\n",
-                MAX_TEST_PORTS);
+        fprintf(stderr, "Use TCP port 1-65535 and num_ports 1-%d.\n", MAX_TEST_PORTS);
         return EXIT_FAILURE;
     }
 
