@@ -27,6 +27,15 @@
 #define MAC_SWEEP_SECONDS 1
 #define PORT_WAIT_SECONDS 2
 
+#include "rate_limit.h"
+
+#ifndef PORT_RATE_FPS
+#define PORT_RATE_FPS 1000
+#endif
+
+#ifndef PORT_RATE_BURST
+#define PORT_RATE_BURST 10
+#endif
 
 typedef struct {
     MacTable *table;
@@ -50,6 +59,7 @@ static int parse_number(const char *text, long max)
 typedef struct Port {
     int fd;
     int num_ports;
+    RateLimit limiter;
     sem_t *free_ports;
     FrameQueue output;
     StatsHandle *stats;
@@ -297,6 +307,10 @@ static void *sender_thread(void *arg)
     SharedFrame *frame;
 
     while (frame_queue_pop(&port->output, &frame) == 1) {
+        if (!rate_limit_take(&port->limiter)) {
+            shared_frame_release(frame);
+            break;
+        }
         int result = frame_write(port->fd, &frame->header, frame->payload);
         int write_error = errno;
 
@@ -409,11 +423,14 @@ static void *port_session(void *arg)
     check_aging_thread(pthread_mutex_unlock(port->ports_lock), "ports unlock");
 
     frame_queue_close(&port->output);
+    rate_limit_close(&port->limiter);
     stop_port_io(port->fd);
 
     if (error == 0) {
         join_worker(sender);
     }
+
+    rate_limit_destroy(&port->limiter);
 
     check_aging_thread(pthread_mutex_lock(port->ports_lock), "ports lock");
 
@@ -799,6 +816,18 @@ static int serve_hosts(int listener, int num_ports, MacTable *mac_table, StatsHa
         }
 
         Port *port = &ports[slot];
+        int rate_error = rate_limit_init( &port->limiter, PORT_RATE_FPS, PORT_RATE_BURST);
+
+        if (rate_error != 0) {
+            fprintf(stderr, "rate_limit_init: %s\n", strerror(rate_error));
+
+            if (close(fd) == -1) 
+                perror("close client");
+
+            status = EXIT_FAILURE;
+            break;
+        }
+
         check_aging_thread(pthread_mutex_lock(&ports_lock), "ports lock");
 
         port->fd = fd;
@@ -811,6 +840,7 @@ static int serve_hosts(int listener, int num_ports, MacTable *mac_table, StatsHa
             fprintf(stderr, "pthread_create session: %s\n", strerror(error));
             port->active = 0;
             frame_queue_destroy(&port->output);
+            rate_limit_destroy(&port->limiter);
             if (close(fd) == -1) {
                 perror("close client");
             }
@@ -857,6 +887,7 @@ static int serve_hosts(int listener, int num_ports, MacTable *mac_table, StatsHa
             ports[i].active = 0;
             stop_port_io(ports[i].fd);
             frame_queue_close(&ports[i].output);
+            rate_limit_close(&ports[i].limiter);
         }
     }
 
