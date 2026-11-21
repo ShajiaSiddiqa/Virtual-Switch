@@ -32,6 +32,7 @@ typedef struct {
     pthread_cond_t wake;
     int stop;
     int failed;
+    unsigned int max_age_seconds;
 } MacAging;
 
 static int parse_number(const char *text, long max)
@@ -365,8 +366,9 @@ static void *mac_aging_worker(void *arg)
         if (aging->stop) 
             break;
 
+        unsigned int max_age = aging->max_age_seconds;
         check_aging_thread(pthread_mutex_unlock(&aging->mutex), "aging unlock");
-        int removed = mac_table_expire(aging->table, MAC_AGE_SECONDS);
+        int removed = mac_table_expire(aging->table, max_age);
         check_aging_thread(pthread_mutex_lock(&aging->mutex), "aging lock");
 
         if (removed < 0) {
@@ -435,7 +437,6 @@ static void *port_session(void *arg)
     return NULL;
 }
 
-// Returns 1 for a permit, 0 for timeout, or -1 on error. 
 static int wait_for_port(sem_t *free_ports)
 {
     struct timespec deadline;
@@ -454,6 +455,127 @@ static int wait_for_port(sem_t *free_ports)
         return 1;
 
     return errno == ETIMEDOUT ? 0 : -1;
+}
+
+typedef struct {
+    atomic_int stopping;
+    int wake_write;
+    sem_t *free_ports;
+    MacTable *mac_table;
+    MacAging *aging;
+} SwitchSignals;
+
+static int request_switch_shutdown(void *arg)
+{
+    SwitchSignals *state = arg;
+
+    if (atomic_exchange(&state->stopping, 1)) 
+        return 0;
+
+    int status = 0;
+    const char byte = 'S';
+    ssize_t result;
+
+    do {
+        result = write(state->wake_write, &byte, 1);
+    } while (result == -1 && errno == EINTR);
+
+    if (result != 1 && !(result == -1 && errno == EAGAIN)) {
+        perror("shutdown wake");
+        status = -1;
+    }
+
+    if (sem_post(state->free_ports) == -1) {
+        perror("shutdown sem_post");
+        status = -1;
+    }
+
+    return status;
+}
+
+static int dump_switch_mac(void *arg)
+{
+    SwitchSignals *state = arg;
+    char response[CONTROL_RESPONSE_SIZE];
+
+    if (show_mac(state->mac_table, response, sizeof(response)) != 0) {
+        fprintf(stderr, "Could not snapshot MAC table for dump\n");
+        return -1;
+    }
+
+    FILE *file = fopen("mac_dump.txt", "w");
+    if (file == NULL) {
+        perror("open MAC dump");
+        return -1;
+    }
+
+    int status = 0;
+
+    if (fputs(response, file) == EOF) {
+        perror("write MAC dump");
+        status = -1;
+    }
+
+    if (fclose(file) == EOF) {
+        perror("close MAC dump");
+        status = -1;
+    }
+
+    if (status == 0) 
+        fprintf(stderr, "MAC table dumped to mac_dump.txt\n");
+
+    return status;
+}
+
+static int reload_switch_config(void *arg)
+{
+    SwitchSignals *state = arg;
+    FILE *file = fopen("vswitch.conf", "r");
+
+    if (file == NULL) {
+        perror("open vswitch.conf");
+        return -1;
+    }
+ 
+    char text[64];
+    int valid = fgets(text, sizeof(text), file) != NULL;
+
+    if (valid) {
+        text[strcspn(text, "\r\n")] = '\0';
+
+        int extra = fgetc(file);
+        if (extra != EOF || ferror(file)) 
+            valid = 0;
+    }
+
+    if (fclose(file) == EOF) {
+        perror("close vswitch.conf");
+        return -1;
+    }
+
+    int seconds = valid ? parse_number(text, 86400) : -1;
+
+    if (seconds == -1) {
+        fprintf(stderr, "Invalid vswitch.conf: use one integer from 1 to 86400\n");
+        return -1;
+    }
+
+    int error = pthread_mutex_lock(&state->aging->mutex);
+    if (error != 0) {
+        fprintf(stderr, "config lock: %s\n", strerror(error));
+        return -1;
+    }
+
+    state->aging->max_age_seconds = (unsigned int)seconds;
+
+    error = pthread_mutex_unlock(&state->aging->mutex);
+    if (error != 0) {
+        fprintf(stderr, "config unlock: %s\n", strerror(error));
+        return -1;
+    }
+
+    fprintf(stderr, "Config reloaded: MAC age = %d seconds\n", seconds);
+    return 0;
 }
 
 static int serve_hosts(int listener, int num_ports, MacTable *mac_table, StatsHandle *stats)
@@ -542,9 +664,9 @@ static int serve_hosts(int listener, int num_ports, MacTable *mac_table, StatsHa
         if (admitted != 1) {
             if (admitted == 0) {
                 const char reply[] = "switch full";
-                if (write_full(fd, reply, sizeof(reply) - 1) != 0) {
+                if (write_full(fd, reply, sizeof(reply) - 1) != 0) 
                     perror("write switch full");
-                }
+
             } else {
                 perror("sem_timedwait");
                 status = EXIT_FAILURE;
@@ -582,8 +704,7 @@ static int serve_hosts(int listener, int num_ports, MacTable *mac_table, StatsHa
         }
 
         const struct timeval send_timeout = {.tv_sec = 2};
-        if (setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO,
-                       &send_timeout, sizeof(send_timeout)) == -1) {
+        if (setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO,  &send_timeout, sizeof(send_timeout)) == -1) {
             perror("setsockopt SO_SNDTIMEO");
             if (close(fd) == -1) 
                 perror("close client");
