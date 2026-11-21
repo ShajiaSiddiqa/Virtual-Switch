@@ -6,12 +6,11 @@
 #include <string.h>  
 #include <errno.h>
 
-static size_t bucket_index(const uint8_t mac[FRAME_MAC_SIZE])
+static size_t bucket_index(const uint8_t mac[FRAME_MAC_SIZE], uint16_t vlan)
 {
-    unsigned int hash = 0;
+    unsigned int hash = vlan;
 
-    for (size_t i = 0; i < FRAME_MAC_SIZE; i++) 
-    {
+    for (size_t i = 0; i < FRAME_MAC_SIZE; i++) {
         hash = hash * 31u + mac[i];
     }
 
@@ -19,12 +18,16 @@ static size_t bucket_index(const uint8_t mac[FRAME_MAC_SIZE])
 }
 
 // caller hold bucket`s lock. 
-static MacEntry *find_entry(MacBucket *bucket, const uint8_t mac[FRAME_MAC_SIZE])
+
+static MacEntry *find_entry( MacBucket *bucket, const uint8_t mac[FRAME_MAC_SIZE], uint16_t vlan)
 {
-    for (MacEntry *entry = bucket->head; entry != NULL; entry = entry->next) 
-    {
-        if (memcmp(entry->mac, mac, FRAME_MAC_SIZE) == 0) 
+    for (MacEntry *entry = bucket->head;
+         entry != NULL;
+         entry = entry->next) {
+        if (entry->vlan == vlan &&
+            memcmp(entry->mac, mac, FRAME_MAC_SIZE) == 0) {
             return entry;
+        }
     }
 
     return NULL;
@@ -96,16 +99,16 @@ static void mark_used(MacTable *table, MacEntry *entry)
     entry->last_used = atomic_fetch_add_explicit(&table->use_sequence, 1,memory_order_relaxed) + 1;
 }
 
-int mac_table_lookup(MacTable *table, const uint8_t mac[FRAME_MAC_SIZE], int *port)
+int mac_table_lookup_vlan(MacTable *table, const uint8_t mac[FRAME_MAC_SIZE], uint16_t vlan, int *port)
 {
-    if (table == NULL || mac == NULL || port == NULL) 
+    if (table == NULL || mac == NULL || port == NULL || vlan < 1 || vlan > 4094) 
         return -1;
 
-    MacBucket *bucket = &table->buckets[bucket_index(mac)];
+    MacBucket *bucket = &table->buckets[bucket_index(mac, vlan)];
     if (pthread_mutex_lock(&bucket->lock) != 0) 
         return -1;
 
-    MacEntry *entry = find_entry(bucket, mac);
+    MacEntry *entry = find_entry(bucket, mac, vlan);
     int found = 0;
 
     if (entry != NULL) 
@@ -181,9 +184,9 @@ static size_t count_port_entries(const MacTable *table, int port)
     return count;
 }
 
-int mac_table_insert(MacTable *table, const uint8_t mac[FRAME_MAC_SIZE],int port)
+int mac_table_insert_vlan(MacTable *table, const uint8_t mac[FRAME_MAC_SIZE],uint16_t vlan, int port)
 {
-    if (table == NULL || mac == NULL || port < 0) {
+    if (table == NULL || mac == NULL || port < 0 || vlan < 1 || vlan > 4094) {
         return -1;
     }
 
@@ -191,7 +194,7 @@ int mac_table_insert(MacTable *table, const uint8_t mac[FRAME_MAC_SIZE],int port
         return -1;
     }
 
-    size_t index = bucket_index(mac);
+    size_t index = bucket_index(mac, vlan);
     MacBucket *bucket = &table->buckets[index];
 
     if (pthread_mutex_lock(&bucket->lock) != 0) {
@@ -206,7 +209,7 @@ int mac_table_insert(MacTable *table, const uint8_t mac[FRAME_MAC_SIZE],int port
         return -1;
     }
 
-    MacEntry *entry = find_entry(bucket, mac);
+    MacEntry *entry = find_entry(bucket, mac, vlan);
     if ((entry == NULL || entry->port != port) && count_port_entries(table, port) >= MAC_TABLE_PORT_LIMIT) {
         pthread_mutex_unlock(&bucket->lock);
         pthread_mutex_unlock(&table->capacity_lock);
@@ -236,6 +239,7 @@ int mac_table_insert(MacTable *table, const uint8_t mac[FRAME_MAC_SIZE],int port
     }
 
     memcpy(entry->mac, mac, FRAME_MAC_SIZE);
+    entry->vlan = vlan;
     entry->port = port;
     entry->last_seen = now;
 
@@ -259,6 +263,16 @@ int mac_table_insert(MacTable *table, const uint8_t mac[FRAME_MAC_SIZE],int port
     }
 
     return result;
+}
+
+int mac_table_lookup( MacTable *table, const uint8_t mac[FRAME_MAC_SIZE], int *port)
+{
+    return mac_table_lookup_vlan(table, mac, 1, port);
+}
+
+int mac_table_insert( MacTable *table, const uint8_t mac[FRAME_MAC_SIZE], int port)
+{
+    return mac_table_insert_vlan(table, mac, 1, port);
 }
 
 static int entry_expired(const struct timespec *last_seen,const struct timespec *now, unsigned int max_age_seconds)
@@ -396,7 +410,6 @@ static int unlock_table(MacTable *table)
         errno = first_error;
         return -1;
     }
-
     return 0;
 }
 
@@ -415,11 +428,9 @@ static int lock_table(MacTable *table)
 
         if (error != 0) {
             while (locked > 0) {
-                int cleanup = pthread_mutex_unlock(
-                    &table->buckets[--locked].lock);
-                if (cleanup != 0) {
+                int cleanup = pthread_mutex_unlock( &table->buckets[--locked].lock);
+                if (cleanup != 0) 
                     abort();
-                }
             }
 
             int cleanup = pthread_mutex_unlock(&table->capacity_lock);
@@ -429,10 +440,8 @@ static int lock_table(MacTable *table)
             errno = error;
             return -1;
         }
-
         locked++;
     }
-
     return 0;
 }
 
@@ -460,6 +469,7 @@ int mac_table_snapshot(MacTable *table, MacRecord *records, size_t capacity, siz
         for (MacEntry *entry = table->buckets[i].head;  entry != NULL; entry = entry->next) {
             memcpy(records[used].mac, entry->mac, FRAME_MAC_SIZE);
             records[used].port = entry->port;
+            records[used].vlan = entry->vlan;
             used++;
         }
     }
