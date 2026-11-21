@@ -8,6 +8,7 @@
 #include <poll.h>
 #include <time.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <signal.h>
 #include <string.h>
@@ -19,6 +20,7 @@
 #include <stdatomic.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
+#include "signal_control.h"
 
 #define MAX_TEST_PORTS 64
 #define MAC_AGE_SECONDS 5
@@ -578,7 +580,7 @@ static int reload_switch_config(void *arg)
     return 0;
 }
 
-static int serve_hosts(int listener, int num_ports, MacTable *mac_table, StatsHandle *stats)
+static int serve_hosts(int listener, int num_ports, MacTable *mac_table, StatsHandle *stats, const sigset_t *signals,MacAging *aging)
 {
     Port ports[MAX_TEST_PORTS] = {0};
     pthread_t sessions[MAX_TEST_PORTS];
@@ -623,32 +625,107 @@ static int serve_hosts(int listener, int num_ports, MacTable *mac_table, StatsHa
         return EXIT_FAILURE;
     }
 
-    struct pollfd listener_poll = {.fd = listener, .events = POLLIN};
+    // struct pollfd listener_poll = {.fd = listener, .events = POLLIN};
+
+    int signal_pipe[2];
+
+    if (pipe(signal_pipe) == -1) {
+        perror("signal pipe");
+
+        if (control_stop(&control) == -1) {
+            perror("control_stop");
+            exit(EXIT_FAILURE);
+        }
+
+        sem_destroy(&free_ports);
+        check_aging_thread(pthread_mutex_destroy(&ports_lock), "ports destroy");
+        return EXIT_FAILURE;
+    }
+
+    int flags = fcntl(signal_pipe[1], F_GETFL);
+
+    if (flags == -1 || fcntl(signal_pipe[1], F_SETFL, flags | O_NONBLOCK) == -1) {
+        perror("signal pipe nonblocking");
+
+        if (control_stop(&control) == -1) {
+            perror("control_stop");
+            exit(EXIT_FAILURE);
+        }
+
+        close(signal_pipe[0]);
+        close(signal_pipe[1]);
+        sem_destroy(&free_ports);
+        check_aging_thread(pthread_mutex_destroy(&ports_lock), "ports destroy");
+        return EXIT_FAILURE;
+    }
+
+    SwitchSignals signal_state = {
+        .wake_write = signal_pipe[1],
+        .free_ports = &free_ports,
+        .mac_table = mac_table,
+        .aging = aging
+    };
+
+    atomic_init(&signal_state.stopping, 0);
+
+    SignalControl signal_control;
+
+    if (signal_control_start(
+            &signal_control, signals,
+            request_switch_shutdown,
+            reload_switch_config,
+            dump_switch_mac,
+            &signal_state) == -1) {
+        perror("signal_control_start");
+
+        if (control_stop(&control) == -1) {
+            perror("control_stop");
+            exit(EXIT_FAILURE);
+        }
+
+        close(signal_pipe[0]);
+        close(signal_pipe[1]);
+        sem_destroy(&free_ports);
+        check_aging_thread(pthread_mutex_destroy(&ports_lock), "ports destroy");
+        return EXIT_FAILURE;
+    }
+
+    struct pollfd events[2] = {
+        {.fd = listener, .events = POLLIN},
+        {.fd = signal_pipe[0], .events = POLLIN}
+    };
 
     for (;;) {
-        sigset_t pending;
-        if (sigpending(&pending) == -1) {
-            perror("sigpending");
-            status = EXIT_FAILURE;
-            break;
-        }
-        if (sigismember(&pending, SIGINT) == 1) 
+             
+        if (atomic_load(&signal_state.stopping)) 
             break;
 
-        int ready = poll(&listener_poll, 1, 200);
-        if (ready == 0 || (ready == -1 && errno == EINTR)) {
+        int ready = poll(events, 2, -1);
+
+        if (ready == -1 && errno == EINTR) 
             continue;
-        }
+
         if (ready == -1) {
             perror("poll");
             status = EXIT_FAILURE;
             break;
         }
-        if ((listener_poll.revents & POLLIN) == 0) {
+
+        if (atomic_load(&signal_state.stopping)) 
+            break;
+
+        if (events[1].revents != 0) {
+            fprintf(stderr, "Unexpected shutdown pipe event\n");
+            status = EXIT_FAILURE;
+            break;
+        }
+
+        if ((events[0].revents & POLLIN) == 0) {
             fprintf(stderr, "Listener stopped accepting connections\n");
             status = EXIT_FAILURE;
             break;
         }
+
 
         int fd = accept(listener, NULL, NULL);
         if (fd == -1) {
@@ -661,6 +738,14 @@ static int serve_hosts(int listener, int num_ports, MacTable *mac_table, StatsHa
         }
 
         int admitted = wait_for_port(&free_ports);
+
+        if (atomic_load(&signal_state.stopping)) {
+            if (close(fd) == -1) {
+                perror("close pending client");
+            }
+            break;
+        }
+
         if (admitted != 1) {
             if (admitted == 0) {
                 const char reply[] = "switch full";
@@ -674,6 +759,7 @@ static int serve_hosts(int listener, int num_ports, MacTable *mac_table, StatsHa
 
             if (close(fd) == -1) 
                 perror("close pending client");
+            
             if (admitted < 0) 
                 break;
 
@@ -740,17 +826,37 @@ static int serve_hosts(int listener, int num_ports, MacTable *mac_table, StatsHa
             break;
     }
 
+    if (signal_control_stop(&signal_control) == -1) {
+        perror("signal_control_stop");
+        status = EXIT_FAILURE;
+
+        if (signal_control.started) 
+            exit(EXIT_FAILURE);
+    }
+
+    if (close(signal_pipe[0]) == -1) {
+        perror("close signal pipe");
+        status = EXIT_FAILURE;
+    }
+
+    if (close(signal_pipe[1]) == -1) {
+        perror("close signal pipe");
+        status = EXIT_FAILURE;
+    }
+
+
     if (control_stop(&control) == -1) {
         perror("control_stop");
         exit(EXIT_FAILURE);
     }
 
     check_aging_thread(pthread_mutex_lock(&ports_lock), "ports lock");
-
+// cleanup loop
     for (int i = 0; i < num_ports; i++) {
         if (ports[i].fd != -1) {
             ports[i].active = 0;
             stop_port_io(ports[i].fd);
+            frame_queue_close(&ports[i].output);
         }
     }
 
@@ -792,6 +898,13 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
+    sigset_t managed_signals;
+
+    if (signal_control_block(&managed_signals) == -1) {
+        perror("signal_control_block");
+        return EXIT_FAILURE;
+    }
+
     int listener = socket(AF_INET, SOCK_STREAM, 0);
     if (listener == -1) {
         perror("socket");
@@ -825,31 +938,31 @@ int main(int argc, char *argv[])
     if (shm_stats_create(&stats, (size_t)num_ports) == -1) {
         perror("shm_stats_create");
 
-        if (mac_table_destroy(&mac_table) != 0) {
+        if (mac_table_destroy(&mac_table) != 0) 
             fprintf(stderr, "Could not destroy MAC table\n");
-        }
 
         goto close_listener;
     }
 
 
-    sigset_t stop_signals;
-    if (sigemptyset(&stop_signals) == -1 ||
-        sigaddset(&stop_signals, SIGINT) == -1) {
-        perror("configure SIGINT");
-        return EXIT_FAILURE;
-    }
+    // sigset_t stop_signals;
+    // if (sigemptyset(&stop_signals) == -1 ||
+    //     sigaddset(&stop_signals, SIGINT) == -1) {
+    //     perror("configure SIGINT");
+    //     return EXIT_FAILURE;
+    // }
 
-    int signal_error = pthread_sigmask(SIG_BLOCK, &stop_signals, NULL);
-    if (signal_error != 0) {
-        fprintf(stderr, "pthread_sigmask: %s\n", strerror(signal_error));
-        return EXIT_FAILURE;
-    }
+    // int signal_error = pthread_sigmask(SIG_BLOCK, &stop_signals, NULL);
+    // if (signal_error != 0) {
+    //     fprintf(stderr, "pthread_sigmask: %s\n", strerror(signal_error));
+    //     return EXIT_FAILURE;
+    // }
 
     MacAging aging = {
         .table = &mac_table,
         .mutex = PTHREAD_MUTEX_INITIALIZER,
-        .wake = PTHREAD_COND_INITIALIZER
+        .wake = PTHREAD_COND_INITIALIZER,
+        .max_age_seconds = MAC_AGE_SECONDS
     };
     pthread_t aging_thread;
 
@@ -858,7 +971,7 @@ int main(int argc, char *argv[])
         fprintf(stderr, "pthread_create MAC aging: %s\n", strerror(error));
         status = EXIT_FAILURE;
     } else {
-        status = serve_hosts(listener, num_ports, &mac_table, &stats);
+        status = serve_hosts(listener, num_ports, &mac_table, &stats,&managed_signals, &aging);
         check_aging_thread(pthread_mutex_lock(&aging.mutex), "aging lock");
         aging.stop = 1;
         check_aging_thread(pthread_cond_signal(&aging.wake), "aging signal");
