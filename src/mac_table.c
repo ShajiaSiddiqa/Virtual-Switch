@@ -10,7 +10,8 @@ static size_t bucket_index(const uint8_t mac[FRAME_MAC_SIZE], uint16_t vlan)
 {
     unsigned int hash = vlan;
 
-    for (size_t i = 0; i < FRAME_MAC_SIZE; i++) {
+    for (size_t i = 0; i < FRAME_MAC_SIZE; i++) 
+    {
         hash = hash * 31u + mac[i];
     }
 
@@ -18,16 +19,12 @@ static size_t bucket_index(const uint8_t mac[FRAME_MAC_SIZE], uint16_t vlan)
 }
 
 // caller hold bucket`s lock. 
-
-static MacEntry *find_entry( MacBucket *bucket, const uint8_t mac[FRAME_MAC_SIZE], uint16_t vlan)
+static MacEntry *find_entry(MacBucket *bucket, const uint8_t mac[FRAME_MAC_SIZE], uint16_t vlan)
 {
-    for (MacEntry *entry = bucket->head;
-         entry != NULL;
-         entry = entry->next) {
-        if (entry->vlan == vlan &&
-            memcmp(entry->mac, mac, FRAME_MAC_SIZE) == 0) {
+    for (MacEntry *entry = bucket->head; entry != NULL; entry = entry->next) 
+    {
+        if (entry->vlan == vlan && memcmp(entry->mac, mac, FRAME_MAC_SIZE) == 0) 
             return entry;
-        }
     }
 
     return NULL;
@@ -38,6 +35,8 @@ int mac_table_init(MacTable *table)
     if (table == NULL) 
         return -1;
 
+    table->move_logger = NULL;
+    table->move_log_context = NULL;
     atomic_init(&table->use_sequence, 0);
 
     table->entry_count = 0;
@@ -184,7 +183,7 @@ static size_t count_port_entries(const MacTable *table, int port)
     return count;
 }
 
-int mac_table_insert_vlan(MacTable *table, const uint8_t mac[FRAME_MAC_SIZE],uint16_t vlan, int port)
+int mac_table_insert_vlan(MacTable *table, const uint8_t mac[FRAME_MAC_SIZE], uint16_t vlan, int port)
 {
     if (table == NULL || mac == NULL || port < 0 || vlan < 1 || vlan > 4094) {
         return -1;
@@ -226,7 +225,10 @@ int mac_table_insert_vlan(MacTable *table, const uint8_t mac[FRAME_MAC_SIZE],uin
         pthread_mutex_unlock(&table->capacity_lock);
 
         if (old_port != port) {
-            printf("MAC moved: port %d -> port %d\n", old_port, port);
+            if (table->move_logger != NULL)
+                table->move_logger(table->move_log_context, mac, vlan, old_port, port);
+            else
+                printf("MAC moved: port %d -> port %d\n", old_port, port);
         }
         return 0;
     }
@@ -263,16 +265,6 @@ int mac_table_insert_vlan(MacTable *table, const uint8_t mac[FRAME_MAC_SIZE],uin
     }
 
     return result;
-}
-
-int mac_table_lookup( MacTable *table, const uint8_t mac[FRAME_MAC_SIZE], int *port)
-{
-    return mac_table_lookup_vlan(table, mac, 1, port);
-}
-
-int mac_table_insert( MacTable *table, const uint8_t mac[FRAME_MAC_SIZE], int port)
-{
-    return mac_table_insert_vlan(table, mac, 1, port);
 }
 
 static int entry_expired(const struct timespec *last_seen,const struct timespec *now, unsigned int max_age_seconds)
@@ -410,6 +402,7 @@ static int unlock_table(MacTable *table)
         errno = first_error;
         return -1;
     }
+
     return 0;
 }
 
@@ -428,9 +421,11 @@ static int lock_table(MacTable *table)
 
         if (error != 0) {
             while (locked > 0) {
-                int cleanup = pthread_mutex_unlock( &table->buckets[--locked].lock);
-                if (cleanup != 0) 
+                int cleanup = pthread_mutex_unlock(
+                    &table->buckets[--locked].lock);
+                if (cleanup != 0) {
                     abort();
+                }
             }
 
             int cleanup = pthread_mutex_unlock(&table->capacity_lock);
@@ -440,8 +435,10 @@ static int lock_table(MacTable *table)
             errno = error;
             return -1;
         }
+
         locked++;
     }
+
     return 0;
 }
 
@@ -501,4 +498,20 @@ int mac_table_clear(MacTable *table)
 
     table->entry_count = 0;
     return unlock_table(table);
+}
+/* Existing callers retain VLAN 1 behavior. */
+int mac_table_lookup(MacTable *table, const uint8_t mac[FRAME_MAC_SIZE], int *port)
+{
+    return mac_table_lookup_vlan(table, mac, 1, port);
+}
+
+int mac_table_insert(MacTable *table, const uint8_t mac[FRAME_MAC_SIZE], int port)
+{
+    return mac_table_insert_vlan(table, mac, 1, port);
+}
+
+void mac_table_set_move_logger(MacTable *table, MacMoveLogger callback, void *context)
+{
+    table->move_logger = callback;
+    table->move_log_context = context;
 }

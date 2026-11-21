@@ -149,3 +149,50 @@ void frame_queue_destroy(FrameQueue *queue)
     check_thread(pthread_cond_destroy(&queue->ready));
     check_thread(pthread_mutex_destroy(&queue->mutex));
 }
+
+int frame_queue_wait(FrameQueue *queue)
+{
+    check_thread(pthread_mutex_lock(&queue->mutex));
+    while (queue->count == 0 && !queue->closed)
+        check_thread(pthread_cond_wait(&queue->ready, &queue->mutex));
+    int available = queue->count != 0;
+    check_thread(pthread_mutex_unlock(&queue->mutex));
+    return available;
+}
+
+int frame_queue_try_pop(FrameQueue *queue, SharedFrame **frame)
+{
+    check_thread(pthread_mutex_lock(&queue->mutex));
+    if (queue->count == 0) {
+        *frame = NULL;
+        check_thread(pthread_mutex_unlock(&queue->mutex));
+        return 0;
+    }
+    PriorityQueue *priority = &queue->priorities[choose_priority(queue)];
+    *frame = priority->slots[priority->head];
+    priority->slots[priority->head] = NULL;
+    priority->head = (priority->head + 1) % FRAME_QUEUE_CAPACITY;
+    priority->count--;
+    queue->count--;
+    check_thread(pthread_mutex_unlock(&queue->mutex));
+    return 1;
+}
+
+size_t frame_queue_clear(FrameQueue *queue)
+{
+    check_thread(pthread_mutex_lock(&queue->mutex));
+    size_t removed = queue->count;
+    for (unsigned int p = 0; p < FRAME_QUEUE_PRIORITIES; p++) {
+        PriorityQueue *priority = &queue->priorities[p];
+        while (priority->count != 0) {
+            shared_frame_release(priority->slots[priority->head]);
+            priority->slots[priority->head] = NULL;
+            priority->head = (priority->head + 1) % FRAME_QUEUE_CAPACITY;
+            priority->count--;
+        }
+    }
+    queue->count = 0;
+    queue->schedule_next = 0;
+    check_thread(pthread_mutex_unlock(&queue->mutex));
+    return removed;
+}

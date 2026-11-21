@@ -46,7 +46,7 @@ static int run_control(const char *command)
     }
 
     int status = EXIT_FAILURE;
-    const struct timeval timeout = {.tv_sec = 3};
+    const struct timeval timeout = {.tv_sec = 10};
 
     if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == -1 || setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) == -1) {
         perror("control timeout");
@@ -145,6 +145,23 @@ cleanup:
 }
 int main(int argc, char *argv[])
 {
+    if ((argc == 4 && (strcmp(argv[1], "vlan") == 0 ||
+                       strcmp(argv[1], "mirror") == 0)) ||
+        (argc == 3 && (strcmp(argv[1], "trunk") == 0 ||
+                       strcmp(argv[1], "shutdown") == 0 || strcmp(argv[1], "up") == 0))) {
+        char command[CONTROL_COMMAND_SIZE];
+        int length;
+        if (argc == 4)
+            length = snprintf(command, sizeof(command), "%s %s %s\n", argv[1], argv[2], argv[3]);
+        else
+            length = snprintf(command, sizeof(command), "%s %s\n", argv[1], argv[2]);
+        if (length < 0 || (size_t)length >= sizeof(command)) {
+            fprintf(stderr, "Command too long\n");
+            return EXIT_FAILURE;
+        }
+        return run_control(command);
+    }
+
     if (argc == 3 && strcmp(argv[1], "show") == 0 && strcmp(argv[2], "mac") == 0) 
         return run_control("show mac\n");
 
@@ -155,6 +172,7 @@ int main(int argc, char *argv[])
         return run_control("clear mac\n");
 
     if ((argc != 2 && argc != 3) || strcmp(argv[1], "stats") != 0 || (argc == 3 && strcmp(argv[2], "--watch") != 0)) {
+        fprintf(stderr, "Additional commands: shutdown <port>, up <port>, vlan <port> <vlan>, trunk <port|0>, mirror <source> <sniffer|0>\n");
         fprintf(stderr, "Usage:\n" "  %s stats [--watch]\n" "  %s show mac\n" "  %s show ports\n" "  %s clear mac\n", argv[0], argv[0], argv[0], argv[0]);
         return EXIT_FAILURE;
     }

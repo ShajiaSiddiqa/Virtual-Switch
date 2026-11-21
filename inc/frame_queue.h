@@ -33,6 +33,12 @@ int frame_queue_try_push(FrameQueue *queue, SharedFrame *frame);
 int frame_queue_pop(FrameQueue *queue, SharedFrame **frame);
 /* Reject new deliveries and wake consumers; queued frames remain drainable. */
 void frame_queue_close(FrameQueue *queue);
+/* Wait for availability without reserving/removing a frame. */
+int frame_queue_wait(FrameQueue *queue);
+/* Nonblocking pop: transfers ownership on 1, returns 0 if empty. */
+int frame_queue_try_pop(FrameQueue *queue, SharedFrame **frame);
+/* Release all queued references; caller serializes against the sender. */
+size_t frame_queue_clear(FrameQueue *queue);
 /* After all users stop, release queued references and destroy synchronization. */
 void frame_queue_destroy(FrameQueue *queue);
 #endif

@@ -108,6 +108,16 @@ static int send_text(ControlServer *server, int fd, const char *text)
     return 0;
 }
 
+static void report_control_error(ControlServer *server, const char *operation)
+{
+    int saved = errno;
+    if (server->error_logger != NULL)
+        server->error_logger(server->error_context, operation, saved);
+    else
+        perror(operation);
+    errno = saved;
+}
+
 static void handle_client(ControlServer *server, int client)
 {
     char command[CONTROL_COMMAND_SIZE];
@@ -121,7 +131,7 @@ static void handle_client(ControlServer *server, int client)
     if (memchr(response, '\0', sizeof(response)) == NULL) {
         if (send_text(server, client,
                       "ERROR\nResponse too large\n") == -1) {
-            perror("control send");
+            report_control_error(server, "control send");
         }
         return;
     }
@@ -129,7 +139,7 @@ static void handle_client(ControlServer *server, int client)
     const char *status = result == 0 ? "OK\n" : "ERROR\n";
 
     if (send_text(server, client, status) == -1 || send_text(server, client, response) == -1) 
-        perror("control send");
+        report_control_error(server, "control send");
 }
 
 static void *control_worker(void *arg)
@@ -143,7 +153,7 @@ static void *control_worker(void *arg)
             return NULL;
 
         if (ready == -1) {
-            perror("control poll");
+            report_control_error(server, "control poll");
             return NULL;
         }
 
@@ -152,14 +162,14 @@ static void *control_worker(void *arg)
             if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) 
                 continue;
 
-            perror("control accept");
+            report_control_error(server, "control accept");
             return NULL;
         }
 
         handle_client(server, client);
 
         if (close(client) == -1) 
-            perror("control close client");
+            report_control_error(server, "control close client");
     }
 }
 
@@ -198,7 +208,8 @@ static int release_resources(ControlServer *server, int owns_path)
     return 0;
 }
 
-int control_start(ControlServer *server, ControlHandler handler, void *context)
+int control_start_logged(ControlServer *server, ControlHandler handler, void *context,
+                         ControlErrorLogger logger, void *log_context)
 {
     if (server == NULL || handler == NULL) {
         errno = EINVAL;
@@ -209,7 +220,9 @@ int control_start(ControlServer *server, ControlHandler handler, void *context)
         .listener = -1,
         .wake_pipe = {-1, -1},
         .handler = handler,
-        .context = context
+        .context = context,
+        .error_logger = logger,
+        .error_context = log_context
     };
 
     int owns_path = 0;
@@ -282,4 +295,8 @@ int control_stop(ControlServer *server)
     }
 
     return release_resources(server, 1);
+}
+int control_start(ControlServer *server, ControlHandler handler, void *context)
+{
+    return control_start_logged(server, handler, context, NULL, NULL);
 }

@@ -11,6 +11,8 @@
 
 typedef int (*ControlHandler)(const char *command, char *response, size_t capacity, void *context);
 
+typedef void (*ControlErrorLogger)(void *context, const char *operation, int error);
+
 typedef struct {
     int listener;
     int wake_pipe[2];
@@ -18,10 +20,14 @@ typedef struct {
     int started;
     ControlHandler handler;
     void *context;
+    ControlErrorLogger error_logger;
+    void *error_context;
 } ControlServer;
 
 int control_start(ControlServer *server, ControlHandler handler, void *context);
 
+int control_start_logged(ControlServer *server, ControlHandler handler, void *context,
+                         ControlErrorLogger logger, void *log_context);
 int control_stop(ControlServer *server);
 
 #endif

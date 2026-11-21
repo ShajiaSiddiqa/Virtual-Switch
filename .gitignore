@@ -44,4 +44,7 @@ switch.local.conf
 .DS_Store
 *.log
 
-build/
+/build/
+/mac_dump.txt
+/src/*.bak
+/inc/*.bak
