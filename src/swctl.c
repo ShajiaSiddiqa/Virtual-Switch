@@ -48,8 +48,7 @@ static int run_control(const char *command)
     int status = EXIT_FAILURE;
     const struct timeval timeout = {.tv_sec = 3};
 
-    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == -1 || 
-        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) == -1) {
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == -1 || setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) == -1) {
         perror("control timeout");
         goto cleanup;
     }
@@ -156,22 +155,14 @@ int main(int argc, char *argv[])
         return run_control("clear mac\n");
 
     if ((argc != 2 && argc != 3) || strcmp(argv[1], "stats") != 0 || (argc == 3 && strcmp(argv[2], "--watch") != 0)) {
-        fprintf(stderr,
-                "Usage:\n"
-                "  %s stats [--watch]\n"
-                "  %s show mac\n"
-                "  %s show ports\n"
-                "  %s clear mac\n",
-                argv[0], argv[0], argv[0], argv[0]);
+        fprintf(stderr, "Usage:\n" "  %s stats [--watch]\n" "  %s show mac\n" "  %s show ports\n" "  %s clear mac\n", argv[0], argv[0], argv[0], argv[0]);
         return EXIT_FAILURE;
     }
 
     int watch = argc == 3;
     sigset_t stop_signals;
 
-    if (sigemptyset(&stop_signals) == -1 ||
-        sigaddset(&stop_signals, SIGINT) == -1 ||
-        sigaddset(&stop_signals, SIGTERM) == -1) {
+    if (sigemptyset(&stop_signals) == -1 || sigaddset(&stop_signals, SIGINT) == -1 || sigaddset(&stop_signals, SIGTERM) == -1) {
         perror("configure signals");
         return EXIT_FAILURE;
     }
@@ -199,20 +190,17 @@ int main(int argc, char *argv[])
             break;
         }
 
-        if (!watch) {
+        if (!watch) 
             break;
-        }
 
         const struct timespec interval = {.tv_sec = 1};
         int received = sigtimedwait(&stop_signals, NULL, &interval);
 
-        if (received == SIGINT || received == SIGTERM) {
+        if (received == SIGINT || received == SIGTERM) 
             break;
-        }
 
-        if (received == -1 && (errno == EAGAIN || errno == EINTR)) {
+        if (received == -1 && (errno == EAGAIN || errno == EINTR)) 
             continue;
-        }
 
         perror("sigtimedwait");
         status = EXIT_FAILURE;
