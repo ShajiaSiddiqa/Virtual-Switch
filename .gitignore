@@ -43,3 +43,5 @@ switch.local.conf
 *~
 .DS_Store
 *.log
+
+build/
