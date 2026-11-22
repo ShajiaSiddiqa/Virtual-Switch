@@ -1,4 +1,5 @@
 #define _POSIX_C_SOURCE 200809L
+#include "../../inc/checked.h"
 #include <errno.h>
 #include <inttypes.h>
 #include <pthread.h>
@@ -48,7 +49,7 @@ typedef struct {
 static void check(int error)
 {
     if (error != 0) {
-        fprintf(stderr, "pthread: %s\n", strerror(error));
+        vsw_posix(fprintf(stderr, "pthread: %s\n", strerror(error)), "fprintf");
         exit(EXIT_FAILURE);
     }
 }
@@ -64,14 +65,14 @@ static uint64_t now_ns(void)
 static uint64_t number(const char *text, uint64_t minimum, uint64_t maximum)
 {
     if (text[0] < '0' || text[0] > '9') {
-        fprintf(stderr, "Invalid unsigned number: %s\n", text);
+        vsw_posix(fprintf(stderr, "Invalid unsigned number: %s\n", text), "fprintf");
         exit(EXIT_FAILURE);
     }
     char *end;
     errno = 0;
     unsigned long long value = strtoull(text, &end, 10);
     if (errno || *end != '\0' || value < minimum || value > maximum) {
-        fprintf(stderr, "Number out of range: %s\n", text);
+        vsw_posix(fprintf(stderr, "Number out of range: %s\n", text), "fprintf");
         exit(EXIT_FAILURE);
     }
     return (uint64_t)value;
@@ -170,7 +171,7 @@ static void *run_worker(void *arg)
             }
         }
         if (found == NULL) {
-            fprintf(stderr, "Preloaded entry missing\n");
+            vsw_posix(fprintf(stderr, "Preloaded entry missing\n"), "fprintf");
             abort();
         }
         if (write) {
@@ -187,14 +188,14 @@ static void *run_worker(void *arg)
 int main(int argc, char **argv)
 {
     if (argc != 7) {
-        fprintf(stderr, "Usage: %s global|striped|rwlock threads ops_per_thread read_percent hot_percent seed\n", argv[0]);
+        vsw_posix(fprintf(stderr, "Usage: %s global|striped|rwlock threads ops_per_thread read_percent hot_percent seed\n", argv[0]), "fprintf");
         return EXIT_FAILURE;
     }
     Mode mode;
     if (strcmp(argv[1], "global") == 0) mode = GLOBAL;
     else if (strcmp(argv[1], "striped") == 0) mode = STRIPED;
     else if (strcmp(argv[1], "rwlock") == 0) mode = RWLOCK;
-    else { fprintf(stderr, "Unknown lock mode\n"); return EXIT_FAILURE; }
+    else { vsw_posix(fprintf(stderr, "Unknown lock mode\n"), "fprintf"); return EXIT_FAILURE; }
     unsigned int threads = (unsigned int)number(argv[2], 1, MAX_THREADS);
     uint64_t operations = number(argv[3], 1, UINT64_C(100000000));
     unsigned int reads = (unsigned int)number(argv[4], 0, 100);
@@ -231,18 +232,18 @@ int main(int argc, char **argv)
     for (unsigned int i = 0; i < ENTRY_COUNT; i++)
         actual_updates += table.entries[i].updates;
     if (writes != actual_updates) {
-        fprintf(stderr, "Lost updates: expected=%" PRIu64 " actual=%" PRIu64 "\n", writes, actual_updates);
+        vsw_posix(fprintf(stderr, "Lost updates: expected=%" PRIu64 " actual=%" PRIu64 "\n", writes, actual_updates), "fprintf");
         return EXIT_FAILURE;
     }
     double seconds = (double)(finish - start) / 1e9;
     uint64_t total = operations * threads;
-    printf("{\"mode\":\"%s\",\"threads\":%u,\"ops_per_thread\":%" PRIu64
+    vsw_posix(printf("{\"mode\":\"%s\",\"threads\":%u,\"ops_per_thread\":%" PRIu64
            ",\"read_percent\":%u,\"hot_percent\":%u,\"seed\":%" PRIu64
            ",\"operations\":%" PRIu64 ",\"writes\":%" PRIu64
            ",\"updates\":%" PRIu64 ",\"checksum\":%" PRIu64
            ",\"seconds\":%.9f,\"ops_per_second\":%.3f}\n",
            argv[1],threads,operations,reads,hot,seed,total,writes,actual_updates,
-           checksum,seconds,(double)total/seconds);
+           checksum,seconds,(double)total/seconds), "printf");
     check(pthread_cond_destroy(&gate.start));
     check(pthread_cond_destroy(&gate.ready_changed));
     check(pthread_mutex_destroy(&gate.mutex));

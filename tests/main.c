@@ -1,3 +1,4 @@
+#include "checked.h"
 #include "frame.h"
 #include "mac_table.h"
 
@@ -9,7 +10,7 @@ static void check(int passed, const char *message)
 {
     if (!passed) 
     {
-        fprintf(stderr, "FAIL: %s\n", message);
+        vsw_posix(fprintf(stderr, "FAIL: %s\n", message), "fprintf");
         exit(EXIT_FAILURE);
     }
 }
@@ -57,7 +58,7 @@ static void test_frame(void)
     check(frame_deserialize(wire, sizeof(wire), &decoded) == -1,
           "Reject an invalid priority");
 
-    puts("PASS: Wire header");
+    vsw_posix(puts("PASS: Wire header"), "puts");
 }
 
 typedef struct {
@@ -102,7 +103,7 @@ static void test_mac_table(void)
     check(mac_table_lookup(&table, mac, &port) == 1 && port == 5,
           "Find MAC on its new port");
 
-    puts("PASS: MAC lookup and move");
+    vsw_posix(puts("PASS: MAC lookup and move"), "puts");
 
     WorkerArgs first = {&table, {0x02, 0, 0, 0, 0, 0x01}, 1};
     WorkerArgs second = {&table, {0x02, 0, 0, 0, 0, 0x11}, 3};
@@ -118,13 +119,13 @@ static void test_mac_table(void)
     check(pthread_join(second_thread, NULL) == 0, "Join second worker");
 
     check(mac_table_destroy(&table) == 0, "Destroy the MAC table");
-    puts("PASS: Concurrent MAC insert and lookup");
+    vsw_posix(puts("PASS: Concurrent MAC insert and lookup"), "puts");
 }
 
 int main(void)
 {
     test_frame();
     test_mac_table();
-    puts("All foundation tests passed.");
+    vsw_posix(puts("All foundation tests passed."), "puts");
     return EXIT_SUCCESS;
 }

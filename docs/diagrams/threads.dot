@@ -1,0 +1,29 @@
+digraph threads {
+ graph [rankdir=TB,bgcolor="white",pad="0.25",nodesep="0.35",ranksep="0.45"];
+ node [shape=box,style="rounded,filled",fillcolor="#eef4fb",color="#285780",fontname="DejaVu Sans",fontsize=11];
+ edge [color="#47667e",fontname="DejaVu Sans",fontsize=9];
+ main [label="Main thread\naccept + admission + cleanup"];
+ rx [label="Session receiver (per port)\nread + validate + learn"];
+ mac [label="Shared MAC table\nstriped locks + optional checkpoint"];
+ queue [label="Three bounded queues\nWRR + frame aging"];
+ tx [label="Sender (per port)\nwrite + release reference"];
+ timer [label="Refill worker (per port)\ncredit tokens + wake sender"];
+ signal [label="Signal worker\nsigwait: INT / HUP / USR1"];
+ admin [label="Admin worker\nUNIX commands + live policy"];
+ aging [label="Aging worker\nexpire source timestamps"];
+ logger [label="Logger worker\ndrain timestamped records"];
+ file [label="Log file",fillcolor="#f7f8fa"];
+ main -> rx [label="starts session"];
+ rx -> mac [label="learn / lookup"];
+ rx -> queue [label="nonblocking enqueue"];
+ queue -> tx [label="ownership transfer"];
+ timer -> tx [label="token availability"];
+ signal -> main [label="wake shutdown"];
+ admin -> queue [label="policy / purge"];
+ aging -> mac [label="expire"];
+ rx -> logger [style=dashed,label="try enqueue log"];
+ logger -> file [label="file I/O"];
+ {rank=same;signal;main;admin;}
+ {rank=same;rx;mac;aging;}
+ {rank=same;queue;timer;}
+}

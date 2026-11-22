@@ -1,4 +1,5 @@
 #define _POSIX_C_SOURCE 200809L
+#include "checked.h"
 #define main switch_program_main
 #include "../src/switch.c"
 #undef main
@@ -53,7 +54,7 @@ int main(void)
     shared_frame_release(frame);
     expect(&ports[0], 0, 10); expect(&ports[1], 1, 10);
     expect(&ports[2], 0, 10); expect(&ports[3], 1, 10);
-    puts("PASS: access broadcast isolated and trunk tag preserved");
+    vsw_posix(puts("PASS: access broadcast isolated and trunk tag preserved"), "puts");
 
     frame = packet(20, a, broadcast);
     assert(forward_frame(&ports[0], frame) == 0);
@@ -61,7 +62,7 @@ int main(void)
     int destination;
     assert(mac_table_lookup_vlan(&table, a, 20, &destination) == 0);
     for (int i = 0; i < 4; i++) expect(&ports[i], 0, 20);
-    puts("PASS: mismatched access ingress dropped before learning");
+    vsw_posix(puts("PASS: mismatched access ingress dropped before learning"), "puts");
 
     frame = packet(20, a, broadcast);
     assert(forward_frame(&ports[3], frame) == 0);
@@ -75,7 +76,7 @@ int main(void)
     shared_frame_release(frame);
     expect(&ports[1], 1, 10); expect(&ports[2], 0, 10);
     expect(&ports[3], 0, 10);
-    puts("PASS: trunk ingress isolation and VLAN-specific known unicast");
+    vsw_posix(puts("PASS: trunk ingress isolation and VLAN-specific known unicast"), "puts");
 
     frame = packet(10, a, broadcast);
     assert(forward_frame(&ports[0], frame) == 0);
@@ -93,7 +94,7 @@ int main(void)
     assert(ports[0].trunk && !ports[3].trunk);
     assert(handle_admin("trunk 0", response, sizeof(response), &admin) == 0);
     for (int i = 0; i < 4; i++) assert(!ports[i].trunk);
-    puts("PASS: live VLAN purge, MAC invalidation, command validation, single trunk");
+    vsw_posix(puts("PASS: live VLAN purge, MAC invalidation, command validation, single trunk"), "puts");
     for (int i = 0; i < 4; i++) {
         frame_queue_destroy(&ports[i].output);
         assert(pthread_mutex_destroy(&ports[i].transmit_lock) == 0);

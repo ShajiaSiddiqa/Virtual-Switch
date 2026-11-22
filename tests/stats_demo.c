@@ -1,3 +1,4 @@
+#include "checked.h"
 #include "shm_stats.h"
 
 #include <stdio.h>
@@ -15,7 +16,7 @@ int main(void)
     int status = EXIT_SUCCESS;
     int input;
 
-    puts("Type a then Enter to increment Port 1. Type q then Enter to exit.");
+    vsw_posix(puts("Type a then Enter to increment Port 1. Type q then Enter to exit."), "puts");
 
     while ((input = getchar()) != EOF && input != 'q') {
         if (input == 'a' &&
@@ -27,7 +28,7 @@ int main(void)
     }
 
     if (ferror(stdin)) {
-        fprintf(stderr, "Could not read input\n");
+        vsw_posix(fprintf(stderr, "Could not read input\n"), "fprintf");
         status = EXIT_FAILURE;
     }
 

@@ -1,4 +1,5 @@
 #define _POSIX_C_SOURCE 200809L
+#include "checked.h"
 
 #include "shm_stats.h"
 #include "control.h"
@@ -56,7 +57,7 @@ static int run_control(const char *command)
     struct sockaddr_un address = {.sun_family = AF_UNIX};
 
     if (strlen(control_socket_path()) >= sizeof(address.sun_path)) {
-        fprintf(stderr, "Control socket path is too long\n");
+        vsw_posix(fprintf(stderr, "Control socket path is too long\n"), "fprintf");
         goto cleanup;
     }
 
@@ -92,7 +93,7 @@ static int run_control(const char *command)
 
     for (;;) {
         if (used == sizeof(response)) {
-            fprintf(stderr, "Control response is too large\n");
+            vsw_posix(fprintf(stderr, "Control response is too large\n"), "fprintf");
             goto cleanup;
         }
 
@@ -123,7 +124,7 @@ static int run_control(const char *command)
         prefix = 6;
         output = stderr;
     } else {
-        fprintf(stderr, "Invalid control response\n");
+        vsw_posix(fprintf(stderr, "Invalid control response\n"), "fprintf");
         goto cleanup;
     }
 
@@ -131,7 +132,7 @@ static int run_control(const char *command)
 
     if (fwrite(response + prefix, 1, body_length, output) != body_length ||
         fflush(output) == EOF) {
-        fprintf(stderr, "Could not display control response\n");
+        vsw_posix(fprintf(stderr, "Could not display control response\n"), "fprintf");
         status = EXIT_FAILURE;
     }
 
@@ -156,7 +157,7 @@ int main(int argc, char *argv[])
         else
             length = snprintf(command, sizeof(command), "%s %s\n", argv[1], argv[2]);
         if (length < 0 || (size_t)length >= sizeof(command)) {
-            fprintf(stderr, "Command too long\n");
+            vsw_posix(fprintf(stderr, "Command too long\n"), "fprintf");
             return EXIT_FAILURE;
         }
         return run_control(command);
@@ -172,8 +173,8 @@ int main(int argc, char *argv[])
         return run_control("clear mac\n");
 
     if ((argc != 2 && argc != 3) || strcmp(argv[1], "stats") != 0 || (argc == 3 && strcmp(argv[2], "--watch") != 0)) {
-        fprintf(stderr, "Additional commands: shutdown <port>, up <port>, vlan <port> <vlan>, trunk <port|0>, mirror <source> <sniffer|0>\n");
-        fprintf(stderr, "Usage:\n" "  %s stats [--watch]\n" "  %s show mac\n" "  %s show ports\n" "  %s clear mac\n", argv[0], argv[0], argv[0], argv[0]);
+        vsw_posix(fprintf(stderr, "Additional commands: shutdown <port>, up <port>, vlan <port> <vlan>, trunk <port|0>, mirror <source> <sniffer|0>\n"), "fprintf");
+        vsw_posix(fprintf(stderr, "Usage:\n" "  %s stats [--watch]\n" "  %s show mac\n" "  %s show ports\n" "  %s clear mac\n", argv[0], argv[0], argv[0], argv[0]), "fprintf");
         return EXIT_FAILURE;
     }
 
@@ -188,7 +189,7 @@ int main(int argc, char *argv[])
     if (watch) {
         int error = pthread_sigmask(SIG_BLOCK, &stop_signals, NULL);
         if (error != 0) {
-            fprintf(stderr, "pthread_sigmask: %s\n", strerror(error));
+            vsw_posix(fprintf(stderr, "pthread_sigmask: %s\n", strerror(error)), "fprintf");
             return EXIT_FAILURE;
         }
     }
@@ -203,7 +204,7 @@ int main(int argc, char *argv[])
 
     for (;;) {
         if (print_stats(&stats) == -1) {
-            fprintf(stderr, "Could not display statistics\n");
+            vsw_posix(fprintf(stderr, "Could not display statistics\n"), "fprintf");
             status = EXIT_FAILURE;
             break;
         }

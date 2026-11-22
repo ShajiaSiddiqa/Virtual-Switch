@@ -3,6 +3,7 @@
 #include "shm_stats.h"
 
 #include <errno.h>
+#include <stdio.h>
 #include <fcntl.h>
 #include <string.h>
 #include <stdlib.h>
@@ -102,7 +103,7 @@ fail:
     {
         int saved = errno;
         int cleanup_result = shm_stats_close(handle);
-        (void)cleanup_result;
+        if (cleanup_result != 0) perror("failure-path cleanup");
         errno = saved;
         return -1;
     }
@@ -155,7 +156,7 @@ fail:
     {
         int saved = errno;
         int cleanup_result = shm_stats_close(handle);
-        (void)cleanup_result;
+        if (cleanup_result != 0) perror("failure-path cleanup");
         errno = saved;
         return -1;
     }

@@ -1,4 +1,5 @@
 #define _POSIX_C_SOURCE 200809L
+#include "checked.h"
 #include "mac_table.h"
 #include <assert.h>
 #include <stdio.h>
@@ -32,5 +33,5 @@ int main(void)
     assert(mac_table_insert_vlan(&table,mac,10,1)==0);
     assert(context.count==1);
     assert(mac_table_destroy(&table)==0);
-    puts("PASS: MAC move callback receives VLAN/ports and holds no MAC locks");
+    vsw_posix(puts("PASS: MAC move callback receives VLAN/ports and holds no MAC locks"), "puts");
 }

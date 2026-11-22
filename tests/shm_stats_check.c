@@ -1,3 +1,4 @@
+#include "checked.h"
 #include "shm_stats.h"
 
 #include <assert.h>
@@ -43,6 +44,6 @@ int main(void)
     assert(snapshot[1].frames_in == 0);
 
     assert(shm_stats_close(&owner) == 0);
-    puts("PASS: two processes shared exactly 20000 counter increments");
+    vsw_posix(puts("PASS: two processes shared exactly 20000 counter increments"), "puts");
     return 0;
 }

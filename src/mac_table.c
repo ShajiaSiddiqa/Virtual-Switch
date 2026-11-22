@@ -1,4 +1,5 @@
 #define _POSIX_C_SOURCE 200809L
+#include "checked.h"
 #include "mac_table.h"
 
 #include <stdio.h>  
@@ -54,9 +55,9 @@ int mac_table_init(MacTable *table)
             while (i > 0) 
             {
                 i--;
-                pthread_mutex_destroy(&table->buckets[i].lock);
+                vsw_pthread(pthread_mutex_destroy(&table->buckets[i].lock), "pthread_mutex_destroy");
             }
-            pthread_mutex_destroy(&table->capacity_lock);
+            vsw_pthread(pthread_mutex_destroy(&table->capacity_lock), "pthread_mutex_destroy");
             return -1;
         }
     }
@@ -110,7 +111,7 @@ static int checkpoint_locked(MacTable *table)
         int error = pthread_mutex_lock(&table->buckets[locked].lock);
         if (error != 0) {
             while (locked > 0)
-                pthread_mutex_unlock(&table->buckets[--locked].lock);
+                vsw_pthread(pthread_mutex_unlock(&table->buckets[--locked].lock), "pthread_mutex_unlock");
             errno = error;
             return -1;
         }
@@ -174,7 +175,7 @@ int mac_table_lookup_vlan(MacTable *table, const uint8_t mac[FRAME_MAC_SIZE], ui
         found = 1;
     }
 
-    pthread_mutex_unlock(&bucket->lock);
+    vsw_pthread(pthread_mutex_unlock(&bucket->lock), "pthread_mutex_unlock");
     /* Release the stripe before taking the capacity/snapshot locks. */
     if (found && mac_table_checkpoint(table) != 0)
         return -1;
@@ -189,7 +190,7 @@ static int replace_oldest(MacTable *table, size_t target_index,  MacEntry *repla
     while (locked < MAC_TABLE_BUCKETS) {
         if (pthread_mutex_lock(&table->buckets[locked].lock) != 0) {
             while (locked > 0) {
-                pthread_mutex_unlock(&table->buckets[--locked].lock);
+                vsw_pthread(pthread_mutex_unlock(&table->buckets[--locked].lock), "pthread_mutex_unlock");
             }
             return -1;
         }
@@ -222,7 +223,7 @@ static int replace_oldest(MacTable *table, size_t target_index,  MacEntry *repla
     }
 
     while (locked > 0) {
-        pthread_mutex_unlock(&table->buckets[--locked].lock);
+        vsw_pthread(pthread_mutex_unlock(&table->buckets[--locked].lock), "pthread_mutex_unlock");
     }
 
     return result;
@@ -258,21 +259,21 @@ int mac_table_insert_vlan(MacTable *table, const uint8_t mac[FRAME_MAC_SIZE], ui
     MacBucket *bucket = &table->buckets[index];
 
     if (pthread_mutex_lock(&bucket->lock) != 0) {
-        pthread_mutex_unlock(&table->capacity_lock);
+        vsw_pthread(pthread_mutex_unlock(&table->capacity_lock), "pthread_mutex_unlock");
         return -1;
     }
 
     struct timespec now;
     if (clock_gettime(CLOCK_MONOTONIC, &now) == -1) {
-        pthread_mutex_unlock(&bucket->lock);
-        pthread_mutex_unlock(&table->capacity_lock);
+        vsw_pthread(pthread_mutex_unlock(&bucket->lock), "pthread_mutex_unlock");
+        vsw_pthread(pthread_mutex_unlock(&table->capacity_lock), "pthread_mutex_unlock");
         return -1;
     }
 
     MacEntry *entry = find_entry(bucket, mac, vlan);
     if ((entry == NULL || entry->port != port) && count_port_entries(table, port) >= MAC_TABLE_PORT_LIMIT) {
-        pthread_mutex_unlock(&bucket->lock);
-        pthread_mutex_unlock(&table->capacity_lock);
+        vsw_pthread(pthread_mutex_unlock(&bucket->lock), "pthread_mutex_unlock");
+        vsw_pthread(pthread_mutex_unlock(&table->capacity_lock), "pthread_mutex_unlock");
         return MAC_TABLE_PORT_LIMIT_REACHED;
     }
 
@@ -283,24 +284,24 @@ int mac_table_insert_vlan(MacTable *table, const uint8_t mac[FRAME_MAC_SIZE], ui
         entry->last_seen = now;
         mark_used(table, entry);
 
-        pthread_mutex_unlock(&bucket->lock);
+        vsw_pthread(pthread_mutex_unlock(&bucket->lock), "pthread_mutex_unlock");
         int committed = checkpoint_locked(table);
-        pthread_mutex_unlock(&table->capacity_lock);
+        vsw_pthread(pthread_mutex_unlock(&table->capacity_lock), "pthread_mutex_unlock");
         if (committed != 0) return -1;
 
         if (old_port != port) {
             if (table->move_logger != NULL)
                 table->move_logger(table->move_log_context, mac, vlan, old_port, port);
             else
-                printf("MAC moved: port %d -> port %d\n", old_port, port);
+                vsw_posix(printf("MAC moved: port %d -> port %d\n", old_port, port), "printf");
         }
         return 0;
     }
 
     entry = malloc(sizeof(*entry));
     if (entry == NULL) {
-        pthread_mutex_unlock(&bucket->lock);
-        pthread_mutex_unlock(&table->capacity_lock);
+        vsw_pthread(pthread_mutex_unlock(&bucket->lock), "pthread_mutex_unlock");
+        vsw_pthread(pthread_mutex_unlock(&table->capacity_lock), "pthread_mutex_unlock");
         return -1;
     }
 
@@ -316,13 +317,13 @@ int mac_table_insert_vlan(MacTable *table, const uint8_t mac[FRAME_MAC_SIZE], ui
         bucket->head = entry;
         table->entry_count++;
 
-        pthread_mutex_unlock(&bucket->lock);
+        vsw_pthread(pthread_mutex_unlock(&bucket->lock), "pthread_mutex_unlock");
         int committed = checkpoint_locked(table);
-        pthread_mutex_unlock(&table->capacity_lock);
+        vsw_pthread(pthread_mutex_unlock(&table->capacity_lock), "pthread_mutex_unlock");
         return committed;
     }
 
-    pthread_mutex_unlock(&bucket->lock);
+    vsw_pthread(pthread_mutex_unlock(&bucket->lock), "pthread_mutex_unlock");
     int result = replace_oldest(table, index, entry);
     if (result == 0) {
         /* Table owns entry after replacement, even if publication fails. */
@@ -330,7 +331,7 @@ int mac_table_insert_vlan(MacTable *table, const uint8_t mac[FRAME_MAC_SIZE], ui
     } else {
         free(entry);
     }
-    pthread_mutex_unlock(&table->capacity_lock);
+    vsw_pthread(pthread_mutex_unlock(&table->capacity_lock), "pthread_mutex_unlock");
     return result;
 }
 

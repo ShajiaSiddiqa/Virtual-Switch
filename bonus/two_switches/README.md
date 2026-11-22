@@ -177,3 +177,12 @@ See [verification record](../../docs/VERIFICATION.md) for scope and limits.
 The build script now links mac_store.c because switch main supports optional
 recovery. This pair is a separate mode from the standalone-switch supervisor;
 combined supervised pipe-pair restart is not implemented.
+
+## Assignment-compliance update
+
+Use the root Makefile for the course build, clean and tool targets. The host is
+now a send/receive client. Mirroring includes accepted ingress and queued egress,
+with one copy per sniffer. Checked failure-path helpers and updated tests require
+fresh development-machine `make check`, `make valgrind-check` and `make tsan-check`.
+Earlier results in these notes describe the preceding tested revision. The required
+three-page report is `docs/SUBMISSION_REPORT.pdf`; longer notes are supplementary.

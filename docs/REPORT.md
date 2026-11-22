@@ -99,11 +99,12 @@ Normal egress is restricted to that VLAN. A configurable sole trunk carries all
 VLANs without removing the tag. VLAN/trunk changes serialize affected transmitters,
 purge queued references and invalidate relevant active MAC mappings.
 
-Mirroring copies accepted ingress into a dedicated sniffer queue using the same
+Mirroring copies accepted ingress and accepted queued egress into a dedicated sniffer queue using the same
 shared allocation. A sniffer is excluded from ordinary forwarding and cannot
 inject ordinary frames. Cross-VLAN capture is intentional. Its full queue drops
 only its own mirrored delivery, so a slow sniffer does not hold the source's
-receiver on network I/O. Mirror capture here is ingress-only.
+receiver on network I/O. Captures are deduplicated per sniffer for one frame; mirror copies never recurse.
+Egress capture means queue acceptance, not a later successful socket write.
 
 ## 6. Control, counters, signals and logging
 
@@ -262,7 +263,29 @@ security, global ports_lock, output queues, logging, network I/O and supervised
 checkpoints are excluded. Native measurements should not run under Valgrind/TSan.
 Three repeats show observed variation, not a statistical confidence guarantee.
 
-## 11. Verification evidence and limitations
+## 11. Real bug: stale capacity after MAC aging
+
+An earlier aging implementation freed entries without decrementing entry_count.
+That left a logically empty table appearing full; the full-table eviction path
+could find no oldest node and reject new learning. The omission was present in
+the earlier code reviewed during development. The new mac_aging_count_check fills
+the table, forces stale timestamps, expires all entries, asserts zero accounting
+and learns a replacement. An isolated generated copy with that earlier omission
+reproduces an assertion failure at table.entry_count == 0. The fixed production
+code decrements the count under the capacity lock and passes. No fault-injected
+source is shipped as production code.
+
+## 12. Compliance update
+
+The required Makefile now builds switch/host/swctl and bonus executables with the
+course flags; clean preserves measured results. The host sends and receives,
+including partial/coalesced/binary/empty frames, with scripted recv and clean
+signal/EOF handling. Mirroring now covers queued egress too. Checked helpers
+handle formerly ignored failure-path calls, and the lexical audit guards against
+reintroducing unchecked standalone calls in its listed function set. That guard
+supplements manual review and is not a proof about arbitrary C semantics.
+
+## 13. Verification evidence and limitations
 
 See [VERIFICATION.md](VERIFICATION.md) for scenario/tool coverage. The development
 machine reported clean Tier 1 Memcheck runs after the final recovery changes,
@@ -276,5 +299,5 @@ Not every possible combination, signal timing, failure injection or hidden test
 has been exercised. Public/hidden course harnesses and formatting rules are not
 certified by this report. There is no raw NIC/TAP data plane, authenticated host
 identity, disk durability, spanning tree, complete policy reload or combined
-supervised pipe-pair recovery. The local demo host is send-only. These boundaries
+supervised pipe-pair recovery. The host now accepts send/sendp/recv/quit while asynchronously receiving frames. These boundaries
 should accompany the reported results rather than be treated as implemented work.

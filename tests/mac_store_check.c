@@ -1,4 +1,5 @@
 #define _POSIX_C_SOURCE 200809L
+#include "checked.h"
 #include "mac_store.h"
 #include <assert.h>
 #include <errno.h>
@@ -26,7 +27,7 @@ static void crash_owner(MacStore *store, const char *name, int commit_first)
     pid_t child=fork();
     assert(child>=0);
     if (child==0) {
-        close(notification[0]);
+        vsw_posix(close(notification[0]), "close");
         assert(mac_store_close(store)==0);
         MacStore writer;
         assert(mac_store_attach(&writer,name)==0);
@@ -34,10 +35,10 @@ static void crash_owner(MacStore *store, const char *name, int commit_first)
         mac_store_test_hold(&writer,commit_first,notification[1]);
         _exit(99);
     }
-    close(notification[1]);
+    vsw_posix(close(notification[1]), "close");
     char byte;
     assert(read(notification[0],&byte,1)==1 && byte=='L');
-    close(notification[0]);
+    vsw_posix(close(notification[0]), "close");
     assert(kill(child,SIGKILL)==0);
     int status;
     assert(waitpid(child,&status,0)==child);
@@ -97,7 +98,7 @@ int main(int argc, char *argv[])
     assert(argc==1);
     assert(setvbuf(stdout,NULL,_IONBF,0)==0);
     char name[128];
-    snprintf(name,sizeof(name),"/vswitch_mac_store_check_%ld",(long)getpid());
+    vsw_format(snprintf(name,sizeof(name),"/vswitch_mac_store_check_%ld",(long)getpid()), sizeof(name));
     MacStore store;
     assert(mac_store_create(&store,name)==0);
     MacStore duplicate;
@@ -125,7 +126,7 @@ int main(int argc, char *argv[])
         _exit(98);
     }
     exited(fresh);
-    puts("PASS: close/reattach and fresh exec preserve MAC, VLAN, port, aging time and LRU state");
+    vsw_posix(puts("PASS: close/reattach and fresh exec preserve MAC, VLAN, port, aging time and LRU state"), "puts");
 
     entries[1].vlan=10;
     assert(mac_store_publish(&store,entries,2,9)==-1 && errno==EINVAL);
@@ -137,23 +138,23 @@ int main(int argc, char *argv[])
     assert(mac_store_publish(&store,NULL,1,9)==-1 && errno==EINVAL);
     assert(mac_store_publish(&store,entries,MAC_STORE_CAPACITY+1,9)==-1 && errno==EINVAL);
     assert(mac_store_read(&store,&image)==0 && image.generation==1);
-    puts("PASS: invalid, duplicate and oversized images rejected without changing committed data");
+    vsw_posix(puts("PASS: invalid, duplicate and oversized images rejected without changing committed data"), "puts");
 
     crash_owner(&store,name,0);
     assert(mac_store_close(&store)==0);
     assert(mac_store_attach(&store,name)==0);
     assert(mac_store_read(&store,&image)==0);
     assert(image.generation==1 && image.count==2 && image.entries[0].port==1);
-    puts("PASS: owner killed during inactive copy leaves previous committed image intact");
+    vsw_posix(puts("PASS: owner killed during inactive copy leaves previous committed image intact"), "puts");
 
     crash_owner(&store,name,1);
     assert(mac_store_read(&store,&image)==0);
     assert(image.generation==2 && image.entries[0].port==3);
     assert(mac_store_publish(&store,entries,2,9)==0);
-    puts("PASS: owner killed after commit preserves new image and mutex remains usable");
+    vsw_posix(puts("PASS: owner killed after commit preserves new image and mutex remains usable"), "puts");
 
     concurrent_publishers(&store,name);
-    puts("PASS: two publishers commit 200 complete images with monotonic generations");
+    vsw_posix(puts("PASS: two publishers commit 200 complete images with monotonic generations"), "puts");
     assert(mac_store_publish(&store,NULL,0,0)==0);
     assert(mac_store_read(&store,&image)==0 && image.count==0);
     assert(mac_store_close(&store)==0);
@@ -162,6 +163,6 @@ int main(int argc, char *argv[])
     assert(mac_store_close(&store)==0);
     assert(mac_store_unlink(name)==0);
     assert(mac_store_attach(&store,name)==-1 && errno==ENOENT);
-    puts("PASS: empty image persists; explicit owner unlink removes the object");
+    vsw_posix(puts("PASS: empty image persists; explicit owner unlink removes the object"), "puts");
     return 0;
 }

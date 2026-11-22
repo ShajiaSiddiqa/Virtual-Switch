@@ -1,5 +1,6 @@
 """Run from the repository root, with no other switch instance running."""
 import os
+import shlex
 import select
 import signal
 import socket
@@ -35,7 +36,7 @@ D = bytes.fromhex("020000000004")
 BROADCAST = b"\xff" * 6
 os.makedirs("build", exist_ok=True)
 with open("build/vlan-integration.log", "w+") as log:
-    process = subprocess.Popen(["./switch", str(PORT), "4"], stdout=log,
+    process = subprocess.Popen([*shlex.split(os.environ.get("SWITCH_COMMAND", os.environ.get("SWITCH", "./switch"))), str(PORT), "4"], stdout=log,
                                stderr=subprocess.STDOUT)
     try:
         deadline = time.monotonic() + 8

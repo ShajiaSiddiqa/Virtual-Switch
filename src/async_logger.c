@@ -1,4 +1,5 @@
 #define _POSIX_C_SOURCE 200809L
+#include "checked.h"
 #include "async_logger.h"
 #include <errno.h>
 #include <stdarg.h>
@@ -8,7 +9,7 @@
 static void check_thread(int error)
 {
     if (error != 0) {
-        fprintf(stderr, "Logger synchronization: %s\n", strerror(error));
+        vsw_posix(fprintf(stderr, "Logger synchronization: %s\n", strerror(error)), "fprintf");
         abort();
     }
 }
@@ -60,7 +61,7 @@ int async_logger_start(AsyncLogger *logger, const char *path)
         return -1;
     /* Each newline becomes visible promptly; only the logger thread writes. */
     if (setvbuf(logger->file, NULL, _IOLBF, 0) != 0) {
-        fclose(logger->file);
+        vsw_posix(fclose(logger->file), "fclose");
         logger->file = NULL;
         errno = EIO;
         return -1;
@@ -78,7 +79,7 @@ int async_logger_start(AsyncLogger *logger, const char *path)
 destroy_mutex:
     check_thread(pthread_mutex_destroy(&logger->mutex));
 close_file:
-    fclose(logger->file);
+    vsw_posix(fclose(logger->file), "fclose");
     logger->file = NULL;
     errno = error;
     return -1;

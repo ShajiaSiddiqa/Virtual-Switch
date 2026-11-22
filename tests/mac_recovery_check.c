@@ -1,4 +1,5 @@
 #define _POSIX_C_SOURCE 200809L
+#include "checked.h"
 #include "mac_table.h"
 #include <assert.h>
 #include <errno.h>
@@ -45,7 +46,7 @@ int main(void)
 {
     assert(MAC_TABLE_CAPACITY==3);
     char name[128];
-    snprintf(name,sizeof(name),"/vswitch_mac_recovery_%ld",(long)getpid());
+    vsw_format(snprintf(name,sizeof(name),"/vswitch_mac_recovery_%ld",(long)getpid()), sizeof(name));
     MacStore store;
     assert(mac_store_create(&store,name)==0);
     MacTable table;
@@ -61,7 +62,7 @@ int main(void)
     assert(find(&image,1) && !find(&image,2) && find(&image,3) && find(&image,4));
     assert(learn(&table,1,2)==0);
     assert(mac_store_read(&store,&image)==0 && find(&image,1)->port==2);
-    puts("PASS: learning, MAC move, lookup LRU and capacity eviction commit synchronously");
+    vsw_posix(puts("PASS: learning, MAC move, lookup LRU and capacity eviction commit synchronously"), "puts");
 
     MacStoreImage original=image;
     assert(mac_table_destroy(&table)==0);
@@ -81,7 +82,7 @@ int main(void)
     mac_table_set_checkpoint(&table,publish,&store);
     assert(learn(&table,1,1)==0 && lookup(&table,1,&port)==1 && port==1);
     assert(mac_store_read(&store,&image)==0 && find(&image,1)->port==1);
-    puts("PASS: restore keeps timestamps/LRU; recovered hints require fresh source learning");
+    vsw_posix(puts("PASS: restore keeps timestamps/LRU; recovered hints require fresh source learning"), "puts");
 
     assert(mac_table_destroy(&table)==0);
     assert(mac_table_init(&table)==0);
@@ -96,7 +97,7 @@ int main(void)
     assert(mac_store_read(&store,&image)==0 && !find(&image,1));
     assert(mac_table_clear(&table)==0);
     assert(mac_store_read(&store,&image)==0 && image.count==0);
-    puts("PASS: aging, validated-port removal and administrative clear persist");
+    vsw_posix(puts("PASS: aging, validated-port removal and administrative clear persist"), "puts");
 
     Worker arguments[2]={{.table=&table,.id=10},{.table=&table,.id=11}};
     pthread_t threads[2];
@@ -107,7 +108,7 @@ int main(void)
     assert(image.use_sequence==atomic_load(&table.use_sequence));
     assert(find(&image,10)->last_used<=image.use_sequence);
     assert(find(&image,11)->last_used<=image.use_sequence);
-    puts("PASS: concurrent learning/lookups publish coherent images without stale snapshot overwrite");
+    vsw_posix(puts("PASS: concurrent learning/lookups publish coherent images without stale snapshot overwrite"), "puts");
 
     assert(learn(&table,12,2)==0);
     mac_table_set_checkpoint(&table,reject,NULL);
@@ -122,6 +123,6 @@ int main(void)
     assert(mac_table_restore(&table,&invalid)==-1 && table.entry_count==0);
     assert(mac_table_destroy(&table)==0);
     assert(mac_store_close(&store)==0 && mac_store_unlink(name)==0);
-    puts("PASS: failed commits and invalid restores preserve memory ownership and cleanup");
+    vsw_posix(puts("PASS: failed commits and invalid restores preserve memory ownership and cleanup"), "puts");
     return 0;
 }

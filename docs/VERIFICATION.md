@@ -87,7 +87,11 @@ not automatically a failed test. Unexpected exit status, mismatched frames,
 missing expected traffic, stalled fast hosts, leaked resources, Memcheck errors or
 TSan diagnostics are failures.
 
-No new C source was changed by the final documentation package. If source changes
-after these results, rerun the affected unit and integration checks before using
-this record as final evidence. Course-specific public/hidden tests and submission
+A later assignment-compliance update changes host.c, mirror forwarding and checked
+failure paths, and adds Makefile/test drivers. The new normal C unit suite, signal
+driver and TCP-peer host tests passed locally; the host tests also passed TSan.
+Those changes require another development-machine make check, make valgrind-check
+and make tsan-check before treating the earlier network results as current-revision
+certification. The delivery environment blocks the UNIX listener; no new full
+switch integration PASS is claimed here. Course-specific public/hidden tests and submission
 format review remain separate final checks.

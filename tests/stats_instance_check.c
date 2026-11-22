@@ -1,4 +1,5 @@
 #define _POSIX_C_SOURCE 200809L
+#include "checked.h"
 #include "shm_stats.h"
 #include <assert.h>
 #include <errno.h>
@@ -9,8 +10,8 @@
 int main(void)
 {
     char a[128],b[128];
-    snprintf(a,sizeof(a),"/vswitch_instance_%ld_a",(long)getpid());
-    snprintf(b,sizeof(b),"/vswitch_instance_%ld_b",(long)getpid());
+    vsw_format(snprintf(a,sizeof(a),"/vswitch_instance_%ld_a",(long)getpid()), sizeof(a));
+    vsw_format(snprintf(b,sizeof(b),"/vswitch_instance_%ld_b",(long)getpid()), sizeof(b));
     StatsHandle owner_a,owner_b,reader;
     assert(setenv("VSWITCH_STATS",a,1)==0);
     assert(shm_stats_create(&owner_a,2)==0);
@@ -33,6 +34,6 @@ int main(void)
     assert(shm_stats_close(&reader)==0);
     assert(shm_stats_close(&owner_b)==0);
     assert(shm_stats_attach(&reader)==-1 && errno==ENOENT);
-    puts("PASS: independent statistics names, correct attachment and owner-specific cleanup");
+    vsw_posix(puts("PASS: independent statistics names, correct attachment and owner-specific cleanup"), "puts");
     return 0;
 }

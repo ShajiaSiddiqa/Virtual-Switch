@@ -41,7 +41,7 @@ metadata = {
     "affinity_cpus": sorted(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else None,
     "parameters": {key: str(value) if isinstance(value, Path) else value
                    for key, value in vars(args).items()},
-    "compile_command": "gcc -std=c11 -Wall -Wextra -Werror -O2 -g -pthread bonus/benchmark/lock_bench.c -o build/lock_bench",
+    "compile_command": os.environ.get("BENCH_COMPILE_COMMAND", "not recorded; set BENCH_COMPILE_COMMAND to the actual build command"),
 }
 try:
     metadata["compiler"] = subprocess.check_output(["gcc", "--version"], text=True).splitlines()[0]

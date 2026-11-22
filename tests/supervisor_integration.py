@@ -84,6 +84,14 @@ with log_path.open("w+") as log:
             except (AssertionError, subprocess.TimeoutExpired):
                 return False
 
+        def active(count):
+            # connect() completing only confirms the TCP handshake, not admission.
+            # Observe readiness without sending a frame that validates a MAC hint.
+            try:
+                return command("show", "ports").count("ACTIVE") == count
+            except (AssertionError, subprocess.TimeoutExpired):
+                return False
+
         def connect(stack):
             peer = stack.enter_context(socket.create_connection(("127.0.0.1", PORT), timeout=5))
             peer.settimeout(5)
@@ -102,6 +110,7 @@ with log_path.open("w+") as log:
         inode = store_path.stat().st_ino
         with ExitStack() as stack:
             a, b, c = [connect(stack) for _ in range(3)]
+            wait_for(lambda: active(3), "three admitted initial clients")
             packet = frame(C, BROADCAST, b"ready")
             c.sendall(packet)
             expect(a, packet)
@@ -129,6 +138,7 @@ with log_path.open("w+") as log:
 
         with ExitStack() as stack:
             unrelated, b, a = [connect(stack) for _ in range(3)]
+            wait_for(lambda: active(3), "three admitted replacement clients")
             # A used to occupy slot 1. It now occupies slot 3. A recovered hint
             # must not select the unrelated client now occupying old slot 1.
             packet = frame(B, A, b"unvalidated destination floods")
@@ -162,6 +172,7 @@ with log_path.open("w+") as log:
 
         with ExitStack() as stack:
             d, peer = [connect(stack) for _ in range(2)]
+            wait_for(lambda: active(2), "two admitted final clients")
             packet = frame(D, BROADCAST, b"after third restart")
             d.sendall(packet)
             expect(peer, packet)

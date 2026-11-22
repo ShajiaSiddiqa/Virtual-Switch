@@ -1,4 +1,5 @@
 #define _POSIX_C_SOURCE 200809L
+#include "checked.h"
 
 #include "signal_control.h"
 
@@ -71,14 +72,14 @@ int main(void)
             request_shutdown, request_reload, request_dump,
             &context) == -1) {
         perror("signal_control_start");
-        close(notification[0]);
-        close(notification[1]);
+        vsw_posix(close(notification[0]), "close");
+        vsw_posix(close(notification[1]), "close");
         return EXIT_FAILURE;
     }
 
-    printf("PID: %ld\n", (long)getpid());
-    puts("Send SIGHUP, then SIGUSR1, then SIGINT.");
-    fflush(stdout);
+    vsw_posix(printf("PID: %ld\n", (long)getpid()), "printf");
+    vsw_posix(puts("Send SIGHUP, then SIGUSR1, then SIGINT."), "puts");
+    vsw_posix(fflush(stdout), "fflush");
 
     char byte;
     ssize_t received;
@@ -90,7 +91,7 @@ int main(void)
     int status = EXIT_SUCCESS;
 
     if (received != 1 || byte != 'S') {
-        fprintf(stderr, "FAIL: shutdown notification\n");
+        vsw_posix(fprintf(stderr, "FAIL: shutdown notification\n"), "fprintf");
         status = EXIT_FAILURE;
     }
 
@@ -98,14 +99,14 @@ int main(void)
         perror("signal_control_stop");
         status = EXIT_FAILURE;
     } else if (context.reloads != 1 || context.dumps != 1) {
-        fprintf(stderr, "FAIL: expected one reload and one dump\n");
+        vsw_posix(fprintf(stderr, "FAIL: expected one reload and one dump\n"), "fprintf");
         status = EXIT_FAILURE;
     } else if (status == EXIT_SUCCESS) {
-        puts("PASS: SIGINT notification and clean signal-thread shutdown");
+        vsw_posix(puts("PASS: SIGINT notification and clean signal-thread shutdown"), "puts");
     }
 
-    close(notification[0]);
-    close(notification[1]);
+    vsw_posix(close(notification[0]), "close");
+    vsw_posix(close(notification[1]), "close");
 
     return status;
 }

@@ -1,4 +1,5 @@
 #define _POSIX_C_SOURCE 200809L
+#include "checked.h"
 #include "frame_queue.h"
 
 #include <stdio.h>
@@ -10,7 +11,7 @@ static const unsigned int schedule[] = {0, 0, 0, 0, 0, 1, 1, 1, 2};
 static void check_thread(int error)
 {
     if (error != 0) {
-        fprintf(stderr, "Frame queue: %s\n", strerror(error));
+        vsw_posix(fprintf(stderr, "Frame queue: %s\n", strerror(error)), "fprintf");
         abort();
     }
 }

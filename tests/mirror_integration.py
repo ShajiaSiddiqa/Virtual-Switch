@@ -1,5 +1,6 @@
 """Run from the repository root, with no other switch instance running."""
 import os
+import shlex
 import select
 import signal
 import socket
@@ -35,7 +36,7 @@ C = bytes.fromhex("020000000003")
 BROADCAST = b"\xff" * 6
 os.makedirs("build", exist_ok=True)
 with open("build/mirror-integration.log", "w+") as log:
-    process = subprocess.Popen(["./switch", str(PORT), "3"], stdout=log,
+    process = subprocess.Popen([*shlex.split(os.environ.get("SWITCH_COMMAND", os.environ.get("SWITCH", "./switch"))), str(PORT), "3"], stdout=log,
                                stderr=subprocess.STDOUT)
     try:
         deadline = time.monotonic() + 8
@@ -69,8 +70,8 @@ with open("build/mirror-integration.log", "w+") as log:
             a.sendall(f); exact(b, f); exact(sniffer, f); quiet(a)
             print("PASS: monitored ingress reaches normal host and cross-VLAN sniffer")
             f = packet(B, BROADCAST, 10, b"not monitored")
-            b.sendall(f); exact(a, f); quiet(b, sniffer)
-            print("PASS: sniffer excluded from ordinary broadcast flooding")
+            b.sendall(f); exact(a, f); exact(sniffer, f); quiet(b)
+            print("PASS: monitored egress mirrored; sniffer is excluded from ordinary flooding")
             f = packet(C, BROADCAST, 20, b"forbidden injection")
             sniffer.sendall(f); quiet(a, b, sniffer)
             command("mirror", "1", "1", ok=False)

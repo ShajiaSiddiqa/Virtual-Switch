@@ -1,5 +1,6 @@
 """Run from the repository root, with no other switch instance running."""
 import os
+import shlex
 import select
 import signal
 import socket
@@ -37,7 +38,7 @@ os.makedirs("build", exist_ok=True)
 log_path = Path(f"build/logger-integration-{PORT}.log")
 log_path.unlink(missing_ok=True)
 with open("build/logger-switch-output.log", "w+") as output:
-    process = subprocess.Popen(["./switch", str(PORT), "2"], stdout=output,
+    process = subprocess.Popen([*shlex.split(os.environ.get("SWITCH_COMMAND", os.environ.get("SWITCH", "./switch"))), str(PORT), "2"], stdout=output,
         stderr=subprocess.STDOUT,
         env={**os.environ, "SWITCH_LOG_PATH": str(log_path)})
     try:

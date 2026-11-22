@@ -1,4 +1,5 @@
 #define _POSIX_C_SOURCE 200809L
+#include "../../inc/checked.h"
 #include "mac_store.h"
 #include <errno.h>
 #include <pthread.h>
@@ -24,7 +25,7 @@ static int setting(const char *name, int fallback, int minimum, int maximum)
     errno=0;
     long value=strtol(text,&end,10);
     if (errno || end==text || *end || value<minimum || value>maximum) {
-        fprintf(stderr,"Invalid %s: expected %d-%d\n",name,minimum,maximum);
+        vsw_posix(fprintf(stderr,"Invalid %s: expected %d-%d\n",name,minimum,maximum), "fprintf");
         return -1;
     }
     return (int)value;
@@ -56,7 +57,7 @@ static void child_environment(const Instance *instance, int restarts)
     for (size_t i=0;i<sizeof(keys)/sizeof(keys[0]);i++)
         if (setenv(keys[i],values[i],1)==-1) {perror("setenv child");_exit(127);}
     char restart_text[32];
-    snprintf(restart_text,sizeof(restart_text),"%d",restarts);
+    vsw_format(snprintf(restart_text,sizeof(restart_text),"%d",restarts), sizeof(restart_text));
     if (setenv("VSWITCH_RESTART_COUNT",restart_text,1)==-1) {perror("setenv restart count");_exit(127);}
     /* This standalone supervisor manages a single switch, not a pipe-linked pair. */
     if (unsetenv("SWITCH_PIPE_READ_FD")==-1 || unsetenv("SWITCH_PIPE_WRITE_FD")==-1) {
@@ -111,7 +112,7 @@ static int wait_worker(pid_t child, const sigset_t *signals, int grace_ms,
             double current=now();
             if (current<0) return -1;
             if (current>=deadline) {
-                fprintf(stderr,"Supervisor: graceful stop timed out; killing worker %ld\n",(long)child);
+                vsw_posix(fprintf(stderr,"Supervisor: graceful stop timed out; killing worker %ld\n",(long)child), "fprintf");
                 if (kill(child,SIGKILL)==-1 && errno!=ESRCH) return -1;
                 forced=1;
             }
@@ -126,7 +127,7 @@ static int wait_worker(pid_t child, const sigset_t *signals, int grace_ms,
 int main(int argc, char *argv[])
 {
     if (argc<2 || strcmp(argv[1],"--help")==0) {
-        fprintf(stderr,"Usage: %s <worker_executable> [worker_arguments...]\n",argv[0]);
+        vsw_posix(fprintf(stderr,"Usage: %s <worker_executable> [worker_arguments...]\n",argv[0]), "fprintf");
         return argc<2 ? 1 : 0;
     }
     int restart_limit=setting("VSWITCH_RESTART_LIMIT",5,0,100);
@@ -134,14 +135,14 @@ int main(int argc, char *argv[])
     int grace_ms=setting("VSWITCH_SUPERVISOR_GRACE_MS",5000,100,60000);
     if (restart_limit<0 || delay_ms<0 || grace_ms<0) return 1;
     sigset_t signals, old_mask;
-    sigemptyset(&signals);
+    vsw_posix(sigemptyset(&signals), "sigemptyset");
     const int numbers[]={SIGINT,SIGTERM,SIGCHLD,SIGHUP,SIGUSR1};
-    for (size_t i=0;i<sizeof(numbers)/sizeof(numbers[0]);i++) sigaddset(&signals,numbers[i]);
+    for (size_t i=0;i<sizeof(numbers)/sizeof(numbers[0]);i++) vsw_posix(sigaddset(&signals,numbers[i]), "sigaddset");
     int error=pthread_sigmask(SIG_BLOCK,&signals,&old_mask);
     if (error) {errno=error;perror("supervisor signal mask");return 1;}
     /* Inherited SIG_IGN for CHLD would otherwise make waitpid lose children. */
     struct sigaction default_action={.sa_handler=SIG_DFL};
-    sigemptyset(&default_action.sa_mask);
+    vsw_posix(sigemptyset(&default_action.sa_mask), "sigemptyset");
     for (size_t i=0;i<sizeof(numbers)/sizeof(numbers[0]);i++) {
         if (sigaction(numbers[i],&default_action,NULL)==-1) {
             perror("supervisor signal disposition");return 1;
@@ -149,16 +150,16 @@ int main(int argc, char *argv[])
     }
     Instance instance;
     long id=(long)getpid();
-    snprintf(instance.store,sizeof(instance.store),"/vswitch_super_%ld_mac",id);
-    snprintf(instance.socket,sizeof(instance.socket),"/tmp/vswitch-super-%ld.sock",id);
-    snprintf(instance.stats,sizeof(instance.stats),"/vswitch_super_%ld_stats",id);
-    snprintf(instance.log,sizeof(instance.log),"build/super-%ld.log",id);
-    snprintf(instance.dump,sizeof(instance.dump),"build/super-%ld-mac.txt",id);
-    snprintf(instance.config,sizeof(instance.config),"build/super-%ld.conf",id);
+    vsw_format(snprintf(instance.store,sizeof(instance.store),"/vswitch_super_%ld_mac",id), sizeof(instance.store));
+    vsw_format(snprintf(instance.socket,sizeof(instance.socket),"/tmp/vswitch-super-%ld.sock",id), sizeof(instance.socket));
+    vsw_format(snprintf(instance.stats,sizeof(instance.stats),"/vswitch_super_%ld_stats",id), sizeof(instance.stats));
+    vsw_format(snprintf(instance.log,sizeof(instance.log),"build/super-%ld.log",id), sizeof(instance.log));
+    vsw_format(snprintf(instance.dump,sizeof(instance.dump),"build/super-%ld-mac.txt",id), sizeof(instance.dump));
+    vsw_format(snprintf(instance.config,sizeof(instance.config),"build/super-%ld.conf",id), sizeof(instance.config));
     MacStore store;
     if (mac_store_create(&store,instance.store)==-1) {perror("create supervisor MAC store");return 1;}
-    printf("SUPERVISOR pid=%ld store=%s socket=%s stats=%s\n",id,instance.store,instance.socket,instance.stats);
-    fflush(stdout);
+    vsw_posix(printf("SUPERVISOR pid=%ld store=%s socket=%s stats=%s\n",id,instance.store,instance.socket,instance.stats), "printf");
+    vsw_posix(fflush(stdout), "fflush");
     int status=0, stopping=0, restarts=0;
     while (!stopping) {
         MacStoreImage recovery;
@@ -173,14 +174,14 @@ int main(int argc, char *argv[])
             execvp(argv[1],&argv[1]);
             perror("exec worker");_exit(127);
         }
-        printf("WORKER pid=%ld restart=%d recovered_generation=%llu entries=%u\n",
-               (long)child,restarts,(unsigned long long)recovery.generation,recovery.count);
-        fflush(stdout);
+        vsw_posix(printf("WORKER pid=%ld restart=%d recovered_generation=%llu entries=%u\n",
+               (long)child,restarts,(unsigned long long)recovery.generation,recovery.count), "printf");
+        vsw_posix(fflush(stdout), "fflush");
         int code;
         int waited=wait_worker(child,&signals,grace_ms,&stopping,&code);
         if (waited<0) {
             perror("wait worker");
-            kill(child,SIGKILL);
+            vsw_kill(child,SIGKILL);
             while (waitpid(child,&code,0)==-1 && errno==EINTR) {}
             status=1;break;
         }
@@ -193,21 +194,21 @@ int main(int argc, char *argv[])
         }
         if (WIFEXITED(code) && WEXITSTATUS(code)==0) break;
         if (WIFEXITED(code) && WEXITSTATUS(code)==127) {
-            fprintf(stderr,"Supervisor: exec/startup failure; not restarting\n");status=1;break;
+            vsw_posix(fprintf(stderr,"Supervisor: exec/startup failure; not restarting\n"), "fprintf");status=1;break;
         }
         if (restarts>=restart_limit) {
-            fprintf(stderr,"Supervisor: restart limit reached (%d)\n",restart_limit);status=1;break;
+            vsw_posix(fprintf(stderr,"Supervisor: restart limit reached (%d)\n",restart_limit), "fprintf");status=1;break;
         }
         if (WIFSIGNALED(code))
-            fprintf(stderr,"Supervisor: worker died from signal %d; restarting\n",WTERMSIG(code));
+            vsw_posix(fprintf(stderr,"Supervisor: worker died from signal %d; restarting\n",WTERMSIG(code)), "fprintf");
         else
-            fprintf(stderr,"Supervisor: worker exited with status %d; restarting\n",WEXITSTATUS(code));
+            vsw_posix(fprintf(stderr,"Supervisor: worker exited with status %d; restarting\n",WEXITSTATUS(code)), "fprintf");
         if (backoff(&signals,delay_ms,&stopping)==-1) {perror("restart backoff");status=1;break;}
         if (!stopping) restarts++;
     }
     if (remove_worker_ipc(&instance)==-1) status=1;
     if (mac_store_close(&store)==-1) {perror("close supervisor MAC store");status=1;}
     if (mac_store_unlink(instance.store)==-1) {perror("unlink supervisor MAC store");status=1;}
-    printf("SUPERVISOR stopped status=%d restarts=%d\n",status,restarts);
+    vsw_posix(printf("SUPERVISOR stopped status=%d restarts=%d\n",status,restarts), "printf");
     return status;
 }

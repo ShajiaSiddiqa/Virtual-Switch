@@ -1,4 +1,5 @@
 #define _POSIX_C_SOURCE 200809L
+#include "checked.h"
 #include "frame_queue.h"
 #include <assert.h>
 #include <stdio.h>
@@ -44,7 +45,7 @@ int main(void)
     }
     assert(queue.count == 3 * FRAME_QUEUE_CAPACITY);
     frame_queue_destroy(&queue);
-    puts("PASS: independent bounded queues and rejected enqueue ownership");
+    vsw_posix(puts("PASS: independent bounded queues and rejected enqueue ownership"), "puts");
 
     frame_queue_init(&queue);
     push(&queue, 0, 0);
@@ -59,7 +60,7 @@ int main(void)
         push(&queue, p, i);
     }
     frame_queue_destroy(&queue);
-    puts("PASS: weighted round robin 5:3:1 with replenished classes");
+    vsw_posix(puts("PASS: weighted round robin 5:3:1 with replenished classes"), "puts");
 
     frame_queue_init(&queue);
     push(&queue, 0, 1);
@@ -72,7 +73,7 @@ int main(void)
     assert(frame->header.priority == 2);
     shared_frame_release(frame);
     frame_queue_destroy(&queue);
-    puts("PASS: overdue low priority overrides high-priority schedule");
+    vsw_posix(puts("PASS: overdue low priority overrides high-priority schedule"), "puts");
 
     frame_queue_init(&queue);
     for (unsigned int round = 0; round < 4; round++) {
@@ -94,7 +95,7 @@ int main(void)
     shared_frame_release(frame);
     assert(frame_queue_pop(&queue, &frame) == 0);
     frame_queue_destroy(&queue);
-    puts("PASS: FIFO wraparound, close rejection, and drain");
+    vsw_posix(puts("PASS: FIFO wraparound, close rejection, and drain"), "puts");
 
     frame_queue_init(&queue);
     pthread_t consumer;
@@ -102,6 +103,6 @@ int main(void)
     frame_queue_close(&queue);
     assert(pthread_join(consumer, NULL) == 0);
     frame_queue_destroy(&queue);
-    puts("PASS: closed empty queue wakes/terminates consumer");
+    vsw_posix(puts("PASS: closed empty queue wakes/terminates consumer"), "puts");
     return 0;
 }

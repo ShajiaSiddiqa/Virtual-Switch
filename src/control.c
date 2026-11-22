@@ -273,7 +273,7 @@ fail:
     {
         int saved = errno;
         int cleanup_result = release_resources(server, owns_path);
-        (void)cleanup_result;
+        if (cleanup_result != 0) perror("failure-path cleanup");
         errno = saved;
         return -1;
     }

@@ -1,3 +1,4 @@
+#include "checked.h"
 #include "mac_table.h"
 
 #include <assert.h>
@@ -42,6 +43,6 @@ int main(void)
     assert(mac_table_lookup(&table, mac, &port) == 1 && port == 3);
     assert(mac_table_destroy(&table) == 0);
 
-    puts("PASS: MAC snapshot, bounds, clear, and relearning");
+    vsw_posix(puts("PASS: MAC snapshot, bounds, clear, and relearning"), "puts");
     return 0;
 }

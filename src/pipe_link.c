@@ -1,4 +1,5 @@
 #define _POSIX_C_SOURCE 200809L
+#include "checked.h"
 #include "pipe_link.h"
 #include <errno.h>
 #include <fcntl.h>
@@ -47,7 +48,7 @@ int pipe_link_adopt(PipeLink *link, int read_fd, int write_fd)
     if (nonblocking(read_fd) == -1 || nonblocking(write_fd) == -1 ||
         nonblocking(link->wake[0]) == -1 || nonblocking(link->wake[1]) == -1) {
         int saved = errno;
-        close(link->wake[0]); close(link->wake[1]);
+        vsw_posix(close(link->wake[0]), "close"); vsw_posix(close(link->wake[1]), "close");
         link->wake[0] = link->wake[1] = -1;
         errno = saved;
         return -1;
@@ -70,7 +71,7 @@ int pipe_link_pair(PipeLink endpoints[2])
         return -1;
     if (pipe(ba) == -1) {
         int saved = errno;
-        close(ab[0]); close(ab[1]);
+        vsw_posix(close(ab[0]), "close"); vsw_posix(close(ab[1]), "close");
         errno = saved;
         return -1;
     }
@@ -92,8 +93,8 @@ int pipe_link_pair(PipeLink endpoints[2])
 fail:
     {
         int saved = errno;
-        pipe_link_destroy(&endpoints[0]);
-        pipe_link_destroy(&endpoints[1]);
+        vsw_zero(pipe_link_destroy(&endpoints[0]), "pipe_link_destroy");
+        vsw_zero(pipe_link_destroy(&endpoints[1]), "pipe_link_destroy");
         errno = saved;
         return -1;
     }

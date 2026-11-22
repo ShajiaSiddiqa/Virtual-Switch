@@ -10,8 +10,7 @@ scope section of the generated report before interpreting results.
 Build from the repository root:
 ```sh
 mkdir -p build
-gcc -std=c11 -Wall -Wextra -Werror -O2 -g -pthread \
-    bonus/benchmark/lock_bench.c -o build/lock_bench
+make build/lock_bench
 python3 bonus/benchmark/check_benchmark.py
 ```
 
@@ -31,7 +30,7 @@ python3 -m pip install matplotlib
 
 Generate target-machine results:
 ```sh
-python3 bonus/benchmark/run_benchmark.py --ops 5000000 --repeats 3
+make benchmark
 ```
 Outputs in results/benchmark: raw.csv, summary.csv, metadata.json,
 throughput.png, throughput.pdf and report.md. Keep actual measured data and
@@ -60,3 +59,10 @@ The recorded final run used --ops 5000000 --repeats 3. Its measurements,
 graphs and report are in [results/benchmark](../../results/benchmark/).
 The two-switch and supervisor bonuses are separate implemented components in
 sibling directories; they are not measured by this experiment.
+
+The default Makefile builds every program with -O0 as required by the course.
+`make benchmark` uses `build/lock_bench_release` (-O2) only for native timing and
+records the actual compiler command through BENCH_COMPILE_COMMAND. Direct runner
+invocations should supply that environment variable rather than claiming an
+unverified compiler command. Existing measured results are not replaced by this
+source update; regeneration is explicit.

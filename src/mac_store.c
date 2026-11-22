@@ -1,4 +1,5 @@
 #define _POSIX_C_SOURCE 200809L
+#include "checked.h"
 #include "mac_store.h"
 
 #include <errno.h>
@@ -58,20 +59,20 @@ static int lock_store(SharedMacStore *shared)
         /* Only the inactive image can have an interrupted copy. */
         if (!valid_committed(shared)) {
             /* Unlock without consistent makes an unrecoverable object fail closed. */
-            pthread_mutex_unlock(&shared->mutex);
+            vsw_pthread(pthread_mutex_unlock(&shared->mutex), "pthread_mutex_unlock");
             errno=EPROTO;
             return -1;
         }
         error=pthread_mutex_consistent(&shared->mutex);
         if (error!=0) {
-            pthread_mutex_unlock(&shared->mutex);
+            vsw_pthread(pthread_mutex_unlock(&shared->mutex), "pthread_mutex_unlock");
             errno=error;
             return -1;
         }
     }
     if (error!=0) {errno=error;return -1;}
     if (!valid_committed(shared)) {
-        pthread_mutex_unlock(&shared->mutex);
+        vsw_pthread(pthread_mutex_unlock(&shared->mutex), "pthread_mutex_unlock");
         errno=EPROTO;
         return -1;
     }
@@ -152,8 +153,8 @@ int mac_store_create(MacStore *store, const char *name)
 fail:
     {
         int saved=errno;
-        mac_store_close(store);
-        shm_unlink(name);
+        vsw_zero(mac_store_close(store), "mac_store_close");
+        vsw_posix(shm_unlink(name), "shm_unlink");
         errno=saved;
         return -1;
     }
@@ -190,7 +191,7 @@ int mac_store_attach(MacStore *store, const char *name)
 fail:
     {
         int saved=errno;
-        mac_store_close(store);
+        vsw_zero(mac_store_close(store), "mac_store_close");
         errno=saved;
         return -1;
     }

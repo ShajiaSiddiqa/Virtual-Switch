@@ -36,7 +36,38 @@ flowchart TB
 The main thread accepts; there is no extra accept worker. Each port session runs
 its receiver and owns a sender plus refill worker. Admin, signal, MAC-aging and
 logger workers are shared. The sender writes outside queue/MAC/ports locks,
-while holding its per-port transmit lock. 
+while holding its per-port transmit lock. See the complete
+[thread diagram](docs/diagrams/threads.svg) and
+[three-page submission report](docs/SUBMISSION_REPORT.pdf).
+
+## Completion checklist
+
+- [x] Fixed wire protocol, partial I/O, malformed/truncated-frame handling and SIGPIPE protection.
+- [x] Bounded output queues, independent sender threads and counted queue rejections.
+- [x] Reference-counted shared frames for flooding and mirroring.
+- [x] VLAN-aware striped MAC table, aging, host moves, LRU eviction and port security.
+- [x] Semaphore-based admission, timed waiting, rejection and port reuse.
+- [x] Three priority queues, weighted round robin and queue aging.
+- [x] Timer-refilled token buckets and condition-variable token waits.
+- [x] Access VLAN isolation and one trunk port.
+- [x] Ingress/queued-egress mirroring, deduplicated per sniffer, with bounded enqueue.
+- [x] Live port shutdown/up, VLAN changes, mirror changes and MAC clear.
+- [x] `swctl`, process-shared statistics and one-second statistics watch.
+- [x] Dedicated signal thread: shutdown, MAC-age reload and MAC dump.
+- [x] Bounded asynchronous timestamped logger.
+- [x] Two switch processes connected directly by two data pipes.
+- [x] Supervisor restart with committed MAC state retained in shared memory.
+- [x] Lock benchmark, target-machine measurements, graph and generated analysis.
+- [x] Functional, memory and race checks for the scenarios listed in the verification record.
+- [x] Required send/receive host, course-flags Makefile and generated three-page submission report.
+- [x] Checked failure-path helpers and a reproducible return-value audit guard.
+- [ ] Run the updated integration/tool suites on the development machine and final official tests.
+- [ ] Review tracked files, student/team details if required, and final commit.
+
+Tests establish behavior for their scenarios; they do not prove that every possible schedule or hidden test is bug-free. See [verification](docs/VERIFICATION.md) and the [three-page submission report](docs/SUBMISSION_REPORT.pdf).
+The longer [implementation notes](docs/REPORT.md) are supplementary.
+
+## Requirements
 
 Linux, GCC, GNU Make, Bash and Python 3 are required. The C programs use libc/POSIX APIs, `-pthread` and `-lrt`. Valgrind is used for memory checks and GCC ThreadSanitizer for race checks. Matplotlib is required only when regenerating benchmark graphs. The bundled
 three-page PDF needs no build dependency; regenerating it uses ReportLab and
@@ -135,20 +166,20 @@ bash tests/basic_forward.sh
 
 User-facing port numbers are one-based. The internal table uses zero-based slots.
 
-| Command                   | Behavior                                                                   |
-| ------------------------- | -------------------------------------------------------------------------- |
-| `./swctl show ports`    | State, VLAN, access/trunk/sniffer mode and mirror destination              |
-| `./swctl show mac`      | MAC, logical port and VLAN                                                 |
-| `./swctl clear mac`     | Clear the table; supervised mode commits before success reply              |
-| `./swctl shutdown 2`    | Disable slot 2, cancel I/O, discard queued references and join its session |
-| `./swctl up 2`          | Enable admission to slot 2; the old TCP client must reconnect              |
-| `./swctl vlan 2 20`     | Make slot 2 an access port in VLAN 20                                      |
-| `./swctl trunk 4`       | Select slot 4 as the sole trunk                                            |
-| `./swctl trunk 0`       | Disable the configurable trunk                                             |
-| `./swctl mirror 1 3`    | Mirror accepted ingress from slot 1 to dedicated sniffer slot 3            |
-| `./swctl mirror 1 0`    | Disable mirroring from slot 1                                              |
-| `./swctl stats`         | Snapshot counters directly from shared memory                              |
-| `./swctl stats --watch` | Refresh the shared-memory counters every second; Ctrl+C stops watch        |
+| Command | Behavior |
+| --- | --- |
+| `./swctl show ports` | State, VLAN, access/trunk/sniffer mode and mirror destination |
+| `./swctl show mac` | MAC, logical port and VLAN |
+| `./swctl clear mac` | Clear the table; supervised mode commits before success reply |
+| `./swctl shutdown 2` | Disable slot 2, cancel I/O, discard queued references and join its session |
+| `./swctl up 2` | Enable admission to slot 2; the old TCP client must reconnect |
+| `./swctl vlan 2 20` | Make slot 2 an access port in VLAN 20 |
+| `./swctl trunk 4` | Select slot 4 as the sole trunk |
+| `./swctl trunk 0` | Disable the configurable trunk |
+| `./swctl mirror 1 3` | Mirror accepted ingress from slot 1 to dedicated sniffer slot 3 |
+| `./swctl mirror 1 0` | Disable mirroring from slot 1 |
+| `./swctl stats` | Snapshot counters directly from shared memory |
+| `./swctl stats --watch` | Refresh the shared-memory counters every second; Ctrl+C stops watch |
 
 An access port must send frames with its assigned VLAN. The trunk preserves the VLAN field. A sniffer can intentionally observe mirrored traffic across VLANs, is excluded from ordinary forwarding, and cannot inject ordinary traffic. Mirroring covers accepted ingress and frames accepted into the monitored port's egress queue. A shared sniffer gets one copy per frame even if both endpoints
 are monitored; a mirror copy is never mirrored recursively. Egress capture is
@@ -167,31 +198,31 @@ kill -INT <actual-switch-pid>
 
 Replace the angle-bracket placeholder with one actual PID. SIGUSR1 writes `mac_dump.txt`; SIGINT requests coordinated shutdown. Do not target every process named `switch` when running multiple instances.
 
-| Default                               |                              Value |
-| ------------------------------------- | ---------------------------------: |
-| MAC age / sweep interval              |                          5 s / 1 s |
-| MAC buckets / table capacity          |                           16 / 256 |
-| Validated MAC/VLAN keys per port      |                                  4 |
-| Admission timeout                     |                                2 s |
-| Priority values                       |            0 high, 1 normal, 2 low |
-| Queue capacity                        |        8 per priority, 24 per port |
-| Weighted schedule / overdue threshold |                     5:3:1 / 100 ms |
-| Rate / initial burst                  |          1000 frames/s / 10 tokens |
-| Refill cadence                        |                approximately 10 ms |
-| Logger capacity / message storage     | 64 records / 256 bytes per message |
+| Default | Value |
+| --- | ---: |
+| MAC age / sweep interval | 5 s / 1 s |
+| MAC buckets / table capacity | 16 / 256 |
+| Validated MAC/VLAN keys per port | 4 |
+| Admission timeout | 2 s |
+| Priority values | 0 high, 1 normal, 2 low |
+| Queue capacity | 8 per priority, 24 per port |
+| Weighted schedule / overdue threshold | 5:3:1 / 100 ms |
+| Rate / initial burst | 1000 frames/s / 10 tokens |
+| Refill cadence | approximately 10 ms |
+| Logger capacity / message storage | 64 records / 256 bytes per message |
 
 Queue-aging fairness requires the port's sender to make progress. The token bucket permits a burst; it is not a strict fixed-window counter.
 
 Instance environment options must be set before workers start:
 
-| Environment            | Default/purpose                                                       |
-| ---------------------- | --------------------------------------------------------------------- |
-| `VSWITCH_SOCKET`     | `/tmp/vswitch.sock`; also used by `swctl`                         |
-| `VSWITCH_STATS`      | `/vswitch_stats`; also used by statistics commands                  |
-| `SWITCH_LOG_PATH`    | `switch.log`                                                        |
-| `SWITCH_DUMP_PATH`   | `mac_dump.txt`                                                      |
-| `SWITCH_CONFIG_PATH` | `vswitch.conf`                                                      |
-| `VSWITCH_MAC_STORE`  | Optional supervisor-owned recovery object; normally set by supervisor |
+| Environment | Default/purpose |
+| --- | --- |
+| `VSWITCH_SOCKET` | `/tmp/vswitch.sock`; also used by `swctl` |
+| `VSWITCH_STATS` | `/vswitch_stats`; also used by statistics commands |
+| `SWITCH_LOG_PATH` | `switch.log` |
+| `SWITCH_DUMP_PATH` | `mac_dump.txt` |
+| `SWITCH_CONFIG_PATH` | `vswitch.conf` |
+| `VSWITCH_MAC_STORE` | Optional supervisor-owned recovery object; normally set by supervisor |
 
 `VSWITCH_NAME` alone does not configure the switch; shell tests may derive the two actual IPC settings from their own test identifier.
 
@@ -199,13 +230,13 @@ Instance environment options must be set before workers start:
 
 The header is 17 bytes followed by `length` payload bytes.
 
-| Byte offset | Field           | Bytes | Valid values                 |
-| ----------: | --------------- | ----: | ---------------------------- |
-|           0 | length          |     2 | 0–1500; payload length only |
-|           2 | source MAC      |     6 | Six address bytes            |
-|           8 | destination MAC |     6 | Six address bytes            |
-|          14 | VLAN            |     2 | 1–4094                      |
-|          16 | priority        |     1 | 0–2                         |
+| Byte offset | Field | Bytes | Valid values |
+| ---: | --- | ---: | --- |
+| 0 | length | 2 | 0–1500; payload length only |
+| 2 | source MAC | 6 | Six address bytes |
+| 8 | destination MAC | 6 | Six address bytes |
+| 14 | VLAN | 2 | 1–4094 |
+| 16 | priority | 1 | 0–2 |
 
 Length and VLAN are network byte order. Python tests use `struct.pack("!H6s6sHB", ...)`. TCP and pipes are byte streams; one read/write is not assumed to transfer a complete frame. See `frame.c`, `io.c`, `frame_io.c` and `pipe_link.c`.
 
@@ -401,7 +432,7 @@ Virtual-Switch/
 │   ├── report.md
 │   ├── throughput.png
 │   └── throughput.pdf
-└── build/              #  ignored by Git
+└── build/              # generated; ignored by Git
 ```
 
 ## Limitations

@@ -1,4 +1,5 @@
 #define _POSIX_C_SOURCE 200809L
+#include "checked.h"
 #include "pipe_link.h"
 #include <assert.h>
 #include <errno.h>
@@ -59,7 +60,7 @@ static void bidirectional(void)
     assert(pipe_link_receive(&links[0],&received,data)==0);
     assert(pipe_link_destroy(&links[0])==0);
     wait_child(child);
-    puts("PASS: two-process bidirectional frames, fragmented header, VLAN/priority and clean EOF");
+    vsw_posix(puts("PASS: two-process bidirectional frames, fragmented header, VLAN/priority and clean EOF"), "puts");
 }
 static void partial_eof(void)
 {
@@ -79,7 +80,7 @@ static void partial_eof(void)
     assert(pipe_link_receive(&links[0],&header,data)==-1 && errno==EPROTO);
     assert(pipe_link_destroy(&links[0])==0);
     wait_child(child);
-    puts("PASS: peer closing mid-header reports protocol error");
+    vsw_posix(puts("PASS: peer closing mid-header reports protocol error"), "puts");
 }
 static void truncated_payload_and_broken_pipe(void)
 {
@@ -98,7 +99,7 @@ static void truncated_payload_and_broken_pipe(void)
     assert(pipe_link_destroy(&links[1])==0);
     assert(pipe_link_send(&links[0],&header,payload)==-1 && errno==EPIPE);
     assert(pipe_link_destroy(&links[0])==0);
-    puts("PASS: truncated payload rejected and broken pipe handled without SIGPIPE termination");
+    vsw_posix(puts("PASS: truncated payload rejected and broken pipe handled without SIGPIPE termination"), "puts");
 }
 static void adoption(void)
 {
@@ -115,7 +116,7 @@ static void adoption(void)
     assert(received.vlan==sent.vlan && received.length==sent.length);
     assert(memcmp(payload,actual,sizeof(payload))==0);
     assert(pipe_link_destroy(&a)==0 && pipe_link_destroy(&b)==0);
-    puts("PASS: inherited descriptors adopted and a single-pipe loopback rejected");
+    vsw_posix(puts("PASS: inherited descriptors adopted and a single-pipe loopback rejected"), "puts");
 }
 static void *receive_until_stop(void *arg)
 {
@@ -142,7 +143,7 @@ static void cancellation(void)
     assert(pthread_join(reader,NULL)==0);
     assert(pipe_link_destroy(&links[0])==0);
     assert(pipe_link_destroy(&links[1])==0);
-    puts("PASS: stop wakes receiver and is idempotent");
+    vsw_posix(puts("PASS: stop wakes receiver and is idempotent"), "puts");
 
     assert(pipe_link_pair(links)==0);
     uint8_t filler[4096]={0};
@@ -158,7 +159,7 @@ static void cancellation(void)
     assert(pthread_join(writer,NULL)==0);
     assert(pipe_link_destroy(&links[0])==0);
     assert(pipe_link_destroy(&links[1])==0);
-    puts("PASS: stop terminates sender when peer does not drain a full pipe");
+    vsw_posix(puts("PASS: stop terminates sender when peer does not drain a full pipe"), "puts");
 }
 int main(void)
 {

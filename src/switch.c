@@ -1,4 +1,5 @@
 #define _POSIX_C_SOURCE 200809L
+#include "checked.h"
 #include "io.h"
 #include "pipe_link.h"
 #include "async_logger.h"
@@ -265,7 +266,7 @@ static int change_vlan_policy(AdminContext *admin, int number, int vlan,
     for (int i = 0; i < admin->num_ports; i++) {
         if (admin->ports[i].pipe_link != NULL &&
             ((trunk_command && number != i + 1) || (!trunk_command && number == i + 1))) {
-            pthread_mutex_unlock(admin->ports_lock);
+            vsw_pthread(pthread_mutex_unlock(admin->ports_lock), "pthread_mutex_unlock");
             return admin_message(response, capacity, "Pipe trunk is fixed for this launch\n", -1);
         }
     }
@@ -289,7 +290,7 @@ static int change_vlan_policy(AdminContext *admin, int number, int vlan,
             while (locked > 0) {
                 --locked;
                 if (affected[locked])
-                    pthread_mutex_unlock(&admin->ports[locked].transmit_lock);
+                    vsw_pthread(pthread_mutex_unlock(&admin->ports[locked].transmit_lock), "pthread_mutex_unlock");
             }
             return admin_message(response, capacity, "Transmit lock failed\n", -1);
         }
@@ -300,7 +301,7 @@ static int change_vlan_policy(AdminContext *admin, int number, int vlan,
         while (locked > 0) {
             --locked;
             if (affected[locked])
-                pthread_mutex_unlock(&admin->ports[locked].transmit_lock);
+                vsw_pthread(pthread_mutex_unlock(&admin->ports[locked].transmit_lock), "pthread_mutex_unlock");
         }
         return admin_message(response, capacity, "Port lock failed\n", -1);
     }
@@ -554,72 +555,65 @@ static int handle_admin(const char *command, char *response, size_t capacity, vo
     return admin_message(response, capacity, "Unknown command\n", -1);
 }
 
-static void enqueue_frame(Port *target, SharedFrame *frame)
+static void mirror_copy(Port *owner, SharedFrame *frame, int copied[MAX_TEST_PORTS])
 {
-    if (!target->active || target->sniffer ||
-        (!target->trunk && target->vlan != frame->header.vlan)) 
-        return;
-
-    if (frame_queue_try_push(&target->output, frame) == 0) {
-        atomic_fetch_add(&target->dropped, 1); 
-        record_stats(target, STATS_FRAMES_DROPPED);
+    int destination = owner->mirror_target;
+    if (destination == 0 || copied[destination - 1]) return;
+    copied[destination - 1] = 1;
+    Port *sniffer = &owner->ports[destination - 1];
+    if (sniffer->active && frame_queue_try_push(&sniffer->output, frame) == 1) {
+        record_stats(sniffer, STATS_FRAMES_MIRRORED);
+    } else {
+        atomic_fetch_add(&sniffer->dropped, 1);
+        record_stats(sniffer, STATS_FRAMES_DROPPED);
     }
 }
 
-static void flood_frame(Port *source, SharedFrame *frame)
+static void enqueue_frame(Port *target, SharedFrame *frame, int copied[MAX_TEST_PORTS])
 {
-    for (int i = 0; i < source->num_ports; i++) {
-        Port *target = &source->ports[i];
-        if (target != source) {
-            enqueue_frame(target, frame);
-        }
+    if (!target->active || target->sniffer ||
+        (!target->trunk && target->vlan != frame->header.vlan)) return;
+    if (frame_queue_try_push(&target->output, frame) == 0) {
+        atomic_fetch_add(&target->dropped, 1);
+        record_stats(target, STATS_FRAMES_DROPPED);
+    } else {
+        /* Capture accepted egress as well as ingress; never re-mirror a copy. */
+        mirror_copy(target, frame, copied);
     }
+}
+
+static void flood_frame(Port *source, SharedFrame *frame, int copied[MAX_TEST_PORTS])
+{
+    for (int i = 0; i < source->num_ports; i++)
+        if (&source->ports[i] != source)
+            enqueue_frame(&source->ports[i], frame, copied);
 }
 
 static int forward_frame_locked(Port *source, SharedFrame *frame)
 {
     int ingress = (int)(source - source->ports);
     int destination;
-
-    /* Validate ingress before learning; access ports cannot select another VLAN. */
     if (!source->active || source->sniffer ||
         (!source->trunk && source->vlan != frame->header.vlan)) {
         atomic_fetch_add(&source->dropped, 1);
         record_stats(source, STATS_FRAMES_DROPPED);
         return 0;
     }
-
     int learned = mac_table_insert_vlan(source->mac_table, frame->header.src,
                                          frame->header.vlan, ingress);
-    if (learned != 0) 
-        return learned;
-
-    /* Mirror accepted ingress once, independently of ordinary forwarding. */
-    if (source->mirror_target != 0) {
-        Port *sniffer = &source->ports[source->mirror_target - 1];
-        if (sniffer->active && frame_queue_try_push(&sniffer->output, frame) == 1) {
-            record_stats(sniffer, STATS_FRAMES_MIRRORED);
-        } else {
-            atomic_fetch_add(&sniffer->dropped, 1);
-            record_stats(sniffer, STATS_FRAMES_DROPPED);
-        }
-    }
-
+    if (learned != 0) return learned;
+    int copied[MAX_TEST_PORTS] = {0};
+    mirror_copy(source, frame, copied);
     if ((frame->header.dst[0] & 1u) != 0) {
-        flood_frame(source, frame);
+        flood_frame(source, frame, copied);
         return 0;
     }
-
     int found = mac_table_lookup_vlan(source->mac_table, frame->header.dst,
                                       frame->header.vlan, &destination);
-    if (found < 0) 
-        return -1;
-
-    if (found == 0) 
-        flood_frame(source, frame);
-    else if (destination != ingress) 
-        enqueue_frame(&source->ports[destination], frame);
-
+    if (found < 0) return -1;
+    if (found == 0) flood_frame(source, frame, copied);
+    else if (destination != ingress)
+        enqueue_frame(&source->ports[destination], frame, copied);
     return 0;
 }
 
@@ -1155,7 +1149,7 @@ static int serve_hosts(int listener, int num_ports, MacTable *mac_table, StatsHa
             exit(EXIT_FAILURE);
         }
 
-        sem_destroy(&free_ports);
+        vsw_posix(sem_destroy(&free_ports), "sem_destroy");
         for (int i = 0; i < num_ports; i++)
             check_aging_thread(pthread_mutex_destroy(&ports[i].transmit_lock),
                                "transmit lock destroy");
@@ -1174,9 +1168,9 @@ static int serve_hosts(int listener, int num_ports, MacTable *mac_table, StatsHa
             exit(EXIT_FAILURE);
         }
 
-        close(signal_pipe[0]);
-        close(signal_pipe[1]);
-        sem_destroy(&free_ports);
+        vsw_posix(close(signal_pipe[0]), "close");
+        vsw_posix(close(signal_pipe[1]), "close");
+        vsw_posix(sem_destroy(&free_ports), "sem_destroy");
         for (int i = 0; i < num_ports; i++)
             check_aging_thread(pthread_mutex_destroy(&ports[i].transmit_lock),
                                "transmit lock destroy");
@@ -1209,9 +1203,9 @@ static int serve_hosts(int listener, int num_ports, MacTable *mac_table, StatsHa
             exit(EXIT_FAILURE);
         }
 
-        close(signal_pipe[0]);
-        close(signal_pipe[1]);
-        sem_destroy(&free_ports);
+        vsw_posix(close(signal_pipe[0]), "close");
+        vsw_posix(close(signal_pipe[1]), "close");
+        vsw_posix(sem_destroy(&free_ports), "sem_destroy");
         for (int i = 0; i < num_ports; i++)
             check_aging_thread(pthread_mutex_destroy(&ports[i].transmit_lock),
                                "transmit lock destroy");
@@ -1344,7 +1338,7 @@ static int serve_hosts(int listener, int num_ports, MacTable *mac_table, StatsHa
         if (session_started[i]) 
             join_worker(sessions[i]);
 
-        printf("Port %d: %u dropped deliveries\n", i + 1, atomic_load(&ports[i].dropped));
+        vsw_posix(printf("Port %d: %u dropped deliveries\n", i + 1, atomic_load(&ports[i].dropped)), "printf");
     }
 
     if (sem_destroy(&free_ports) == -1) {
@@ -1407,7 +1401,7 @@ int main(int argc, char *argv[])
             end_read == read_text || end_write == write_text || *end_read || *end_write ||
             read_fd < 0 || write_fd < 0 || read_fd > INT_MAX || write_fd > INT_MAX ||
             num_ports < 2) {
-            fprintf(stderr, "Invalid inherited pipe descriptors or port count\n");
+            vsw_posix(fprintf(stderr, "Invalid inherited pipe descriptors or port count\n"), "fprintf");
             return EXIT_FAILURE;
         }
         if (pipe_link_adopt(&inherited_link, (int)read_fd, (int)write_fd) == -1) {
@@ -1423,7 +1417,7 @@ int main(int argc, char *argv[])
         log_path = "switch.log";
     if (async_logger_start(&logger, log_path) == -1) {
         perror("async_logger_start");
-        if (pipe_link != NULL) pipe_link_destroy(pipe_link);
+        if (pipe_link != NULL) vsw_zero(pipe_link_destroy(pipe_link), "pipe_link_destroy");
         return EXIT_FAILURE;
     }
     atomic_init(&logging_errors, 0);
@@ -1433,7 +1427,7 @@ int main(int argc, char *argv[])
     int listener = socket(AF_INET, SOCK_STREAM, 0);
     if (listener == -1) {
         switch_error("socket");
-        if (pipe_link != NULL) pipe_link_destroy(pipe_link);
+        if (pipe_link != NULL) vsw_zero(pipe_link_destroy(pipe_link), "pipe_link_destroy");
         runtime_logger = NULL;
         if (async_logger_stop(&logger) == -1)
             perror("async_logger_stop");
@@ -1476,14 +1470,14 @@ int main(int argc, char *argv[])
         MacStoreImage image;
         if (mac_store_attach(&recovery_store, store_name) != 0) {
             switch_error("attach recovery store");
-            mac_table_destroy(&mac_table);
+            vsw_zero(mac_table_destroy(&mac_table), "mac_table_destroy");
             goto close_listener;
         }
         recovery_attached = 1;
         if (mac_store_read(&recovery_store, &image) != 0 ||
             mac_table_restore(&mac_table, &image) != 0) {
             switch_error("restore MAC image");
-            mac_table_destroy(&mac_table);
+            vsw_zero(mac_table_destroy(&mac_table), "mac_table_destroy");
             goto close_listener;
         }
         mac_table_set_checkpoint(&mac_table, persist_mac_image, &recovery_store);
@@ -1577,7 +1571,7 @@ close_listener:
         perror("async_logger_stop");
         status = EXIT_FAILURE;
     }
-    printf("Logger: %lu dropped messages, %lu submission errors\n",
-           dropped_logs, failed_logs);
+    vsw_posix(printf("Logger: %lu dropped messages, %lu submission errors\n",
+           dropped_logs, failed_logs), "printf");
     return status;
 }

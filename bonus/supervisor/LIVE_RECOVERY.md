@@ -152,3 +152,12 @@ the recovery unit Memcheck result as a full Memcheck shutdown of every killed
 network worker. Tests establish their stated scenarios, not every crash timing.
 The [technical report](../../docs/REPORT.md) documents synchronization costs and
 known limitations, and [verification](../../docs/VERIFICATION.md) lists evidence.
+
+## Assignment-compliance update
+
+Use the root Makefile for the course build, clean and tool targets. The host is
+now a send/receive client. Mirroring includes accepted ingress and queued egress,
+with one copy per sniffer. Checked failure-path helpers and updated tests require
+fresh development-machine `make check`, `make valgrind-check` and `make tsan-check`.
+Earlier results in these notes describe the preceding tested revision. The required
+three-page report is `docs/SUBMISSION_REPORT.pdf`; longer notes are supplementary.

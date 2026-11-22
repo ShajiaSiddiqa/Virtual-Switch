@@ -1,4 +1,5 @@
 #define _POSIX_C_SOURCE 200809L
+#include "checked.h"
 #define main switch_program_main
 #include "../src/switch.c"
 #undef main
@@ -64,13 +65,28 @@ int main(void)
     shared_frame_release(normal); shared_frame_release(copy);
     assert(atomic_load(&frame->references) == 1);
     shared_frame_release(frame);
-    puts("PASS: known unicast mirrored across VLANs without payload copies");
+    vsw_posix(puts("PASS: known unicast mirrored across VLANs without payload copies"), "puts");
+
+    frame = packet(10, b, a);
+    assert(forward_frame(&ports[1], frame) == 0);
+    shared_frame_release(frame);
+    expect(&ports[0], 1, 10); expect(&ports[2], 1, 10);
+    vsw_posix(puts("PASS: monitored egress is mirrored independently of ingress"), "puts");
+
+    /* Same sniffer on both endpoints must get only one reference per frame. */
+    assert(handle_admin("mirror 2 3", response, sizeof(response), &admin) == 0);
+    frame = packet(10, a, b);
+    assert(forward_frame(&ports[0], frame) == 0);
+    shared_frame_release(frame);
+    expect(&ports[1], 1, 10); expect(&ports[2], 1, 10); expect(&ports[2], 0, 10);
+    assert(handle_admin("mirror 2 0", response, sizeof(response), &admin) == 0);
+    vsw_posix(puts("PASS: shared sniffer deduplicates ingress/egress copies"), "puts");
 
     frame = packet(20, a, broadcast);
     assert(forward_frame(&ports[2], frame) == 0);
     shared_frame_release(frame);
     for (int i=0; i<4; i++) expect(&ports[i], 0, 20);
-    puts("PASS: dedicated sniffer cannot inject ordinary traffic");
+    vsw_posix(puts("PASS: dedicated sniffer cannot inject ordinary traffic"), "puts");
 
     for (unsigned int i=0; i<FRAME_QUEUE_CAPACITY; i++) {
         frame = packet(10, a, b);
@@ -85,8 +101,8 @@ int main(void)
     shared_frame_release(frame);
     expect(&ports[1], 1, 10);
     assert(atomic_load(&ports[2].dropped) == before + 1);
-    assert(memory.ports[2].frames_mirrored == 1 + FRAME_QUEUE_CAPACITY);
-    puts("PASS: full sniffer queue drops only mirror copy and counts rejection");
+    assert(memory.ports[2].frames_mirrored == 3 + FRAME_QUEUE_CAPACITY);
+    vsw_posix(puts("PASS: full sniffer queue drops only mirror copy and counts rejection"), "puts");
 
     assert(handle_admin("mirror 1 1", response, sizeof(response), &admin) == -1);
     assert(handle_admin("mirror 3 2", response, sizeof(response), &admin) == -1);
@@ -99,7 +115,7 @@ int main(void)
     assert(forward_frame(&ports[0], frame) == 0);
     shared_frame_release(frame);
     expect(&ports[1], 1, 10); expect(&ports[2], 0, 10);
-    puts("PASS: validation, disable, queued-reference purge, and forwarding");
+    vsw_posix(puts("PASS: validation, disable, queued-reference purge, and forwarding"), "puts");
     for (int i=0; i<4; i++) {
         frame_queue_destroy(&ports[i].output);
         assert(pthread_mutex_destroy(&ports[i].transmit_lock) == 0);

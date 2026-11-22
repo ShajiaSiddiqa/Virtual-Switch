@@ -1,4 +1,5 @@
 #define _POSIX_C_SOURCE 200809L
+#include "checked.h"
 #include "mac_store.h"
 #include <assert.h>
 #include <fcntl.h>
@@ -17,9 +18,9 @@ int main(int argc, char *argv[])
     int ignore=strcmp(argv[1],"ignore-stop")==0;
     int clean=strcmp(argv[1],"clean-exit")==0;
     sigset_t signals;
-    sigemptyset(&signals);sigaddset(&signals,SIGTERM);
-    sigaddset(&signals,SIGHUP);sigaddset(&signals,SIGUSR1);
-    if (!ignore) sigaddset(&signals,SIGINT);
+    vsw_posix(sigemptyset(&signals), "sigemptyset");vsw_posix(sigaddset(&signals,SIGTERM), "sigaddset");
+    vsw_posix(sigaddset(&signals,SIGHUP), "sigaddset");vsw_posix(sigaddset(&signals,SIGUSR1), "sigaddset");
+    if (!ignore) vsw_posix(sigaddset(&signals,SIGINT), "sigaddset");
     else assert(signal(SIGINT,SIG_IGN)!=SIG_ERR);
     assert(pthread_sigmask(SIG_BLOCK,&signals,NULL)==0);
     const char *name=getenv("VSWITCH_MAC_STORE");

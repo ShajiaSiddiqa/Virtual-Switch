@@ -1,4 +1,5 @@
 #define _POSIX_C_SOURCE 200809L
+#include "checked.h"
 #define main switch_program_main
 #include "../src/switch.c"
 #undef main
@@ -44,7 +45,7 @@ int main(void)
     assert(handle_admin("up 1",response,sizeof(response),&admin)==0);
     assert(handle_admin("up 1",response,sizeof(response),&admin)==0);
     permits(&free_ports,2);
-    puts("PASS: idle shutdown/up are idempotent and preserve semaphore capacity");
+    vsw_posix(puts("PASS: idle shutdown/up are idempotent and preserve semaphore capacity"), "puts");
 
     atomic_int stopping;
     atomic_init(&stopping,0);
@@ -63,15 +64,15 @@ int main(void)
         permits(&free_ports,1);
         int destination;
         assert(mac_table_lookup_vlan(&table,mac,1,&destination)==0);
-        close(pair[1]);
+        vsw_posix(close(pair[1]), "close");
         assert(handle_admin("up 1",response,sizeof(response),&admin)==0);
         permits(&free_ports,2);
     }
-    puts("PASS: 20 active shutdown/reopen cycles join sessions and remove MACs");
+    vsw_posix(puts("PASS: 20 active shutdown/reopen cycles join sessions and remove MACs"), "puts");
     assert(handle_admin("shutdown 0",response,sizeof(response),&admin)==-1);
     assert(handle_admin("up 3",response,sizeof(response),&admin)==-1);
     assert(handle_admin("up 1 trailing",response,sizeof(response),&admin)==-1);
-    puts("PASS: invalid lifecycle commands rejected");
+    vsw_posix(puts("PASS: invalid lifecycle commands rejected"), "puts");
     for(int i=0;i<2;i++) assert(pthread_mutex_destroy(&ports[i].transmit_lock)==0);
     assert(sem_destroy(&free_ports)==0);
     assert(pthread_mutex_destroy(&admission)==0);
