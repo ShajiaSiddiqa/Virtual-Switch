@@ -27,7 +27,9 @@
 #include "signal_control.h"
 
 #define MAX_TEST_PORTS 64
+#ifndef MAC_AGE_SECONDS
 #define MAC_AGE_SECONDS 5
+#endif
 #define MAC_SWEEP_SECONDS 1
 #define PORT_WAIT_SECONDS 2
 
@@ -1358,6 +1360,11 @@ static int serve_hosts(int listener, int num_ports, MacTable *mac_table, StatsHa
     return status;
 }
 
+static int persist_mac_image(void *context, const MacStoreImage *image)
+{
+    return mac_store_publish(context, image->entries, image->count, image->use_sequence);
+}
+
 int main(int argc, char *argv[])
 {
     if (argc != 3) {
@@ -1434,6 +1441,8 @@ int main(int argc, char *argv[])
     }
 
     int status = EXIT_FAILURE;
+    MacStore recovery_store = {.fd = -1};
+    int recovery_attached = 0;
     int reuse_address = 1;
     if (setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &reuse_address,
                    sizeof(reuse_address)) == -1) {
@@ -1462,6 +1471,25 @@ int main(int argc, char *argv[])
         goto close_listener;
     }
     mac_table_set_move_logger(&mac_table, log_mac_move, &logger);
+    const char *store_name = getenv("VSWITCH_MAC_STORE");
+    if (store_name != NULL) {
+        MacStoreImage image;
+        if (mac_store_attach(&recovery_store, store_name) != 0) {
+            switch_error("attach recovery store");
+            mac_table_destroy(&mac_table);
+            goto close_listener;
+        }
+        recovery_attached = 1;
+        if (mac_store_read(&recovery_store, &image) != 0 ||
+            mac_table_restore(&mac_table, &image) != 0) {
+            switch_error("restore MAC image");
+            mac_table_destroy(&mac_table);
+            goto close_listener;
+        }
+        mac_table_set_checkpoint(&mac_table, persist_mac_image, &recovery_store);
+        switch_log("Recovered MAC image: generation=%llu entries=%u",
+                   (unsigned long long)image.generation, image.count);
+    }
     StatsHandle stats;
 
     if (shm_stats_create(&stats, (size_t)num_ports) == -1) {
@@ -1527,6 +1555,10 @@ int main(int argc, char *argv[])
     }
 
 close_listener:
+    if (recovery_attached && mac_store_close(&recovery_store) != 0) {
+        switch_error("close recovery store");
+        status = EXIT_FAILURE;
+    }
     if (pipe_link != NULL && pipe_link_destroy(pipe_link) == -1) {
         switch_error("pipe_link_destroy");
         status = EXIT_FAILURE;

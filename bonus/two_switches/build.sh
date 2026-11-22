@@ -3,7 +3,7 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 mkdir -p build
 cc=(gcc -std=c11 -Wall -Wextra -Werror -g -O0 -Iinc -pthread)
-modules=(src/pipe_link.c src/async_logger.c src/rate_limit.c
+modules=(src/mac_store.c src/pipe_link.c src/async_logger.c src/rate_limit.c
     src/signal_control.c src/control.c src/frame_queue.c src/shared_frame.c
     src/frame_io.c src/frame.c src/io.c src/mac_table.c src/shm_stats.c)
 "${cc[@]}" src/switch.c "${modules[@]}" -lrt -o switch

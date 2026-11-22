@@ -1,511 +1,263 @@
 # Virtual Switch
 
-A multithreaded software network switch written in C for the Operating Systems course (Fall 2026).
+A multithreaded user-space Layer 2 switch written in C11 for an Operating Systems project. TCP clients represent hosts; a separate `swctl` process provides management through a UNIX socket and shared-memory statistics.
 
-## Introduction
+The implementation includes the core switch, advanced scheduling and administration, two switches linked by anonymous pipes, crash recovery under a supervisor, and a reproducible lock benchmark.
 
-Virtual Switch is a user-space simulation of a layer-2 Ethernet switch. Each TCP client connects to one logical switch port and sends frames in a fixed format. The switch learns which host sits on which port, forwards each frame only where it needs to go, and handles the concurrency problems a real switch faces: many ports at once, slow or misbehaving hosts, shared frames, and live reconfiguration.
+## Completion checklist
 
-**Motivation.** Real switches are built around hardware, but their core logic (learning, forwarding, flooding, and queueing) is also a strong systems programming exercise. The project combines processes, threads, mutexes, condition variables, semaphores, sockets, signals, and shared memory in one codebase. It builds on Labs 02 to 08.
+- [x] Fixed wire protocol, partial I/O, malformed/truncated-frame handling and SIGPIPE protection.
+- [x] Bounded output queues, independent sender threads and counted queue rejections.
+- [x] Reference-counted shared frames for flooding and mirroring.
+- [x] VLAN-aware striped MAC table, aging, host moves, LRU eviction and port security.
+- [x] Semaphore-based admission, timed waiting, rejection and port reuse.
+- [x] Three priority queues, weighted round robin and queue aging.
+- [x] Timer-refilled token buckets and condition-variable token waits.
+- [x] Access VLAN isolation and one trunk port.
+- [x] Dedicated ingress sniffer and nonblocking mirror enqueue.
+- [x] Live port shutdown/up, VLAN changes, mirror changes and MAC clear.
+- [x] `swctl`, process-shared statistics and one-second statistics watch.
+- [x] Dedicated signal thread: shutdown, MAC-age reload and MAC dump.
+- [x] Bounded asynchronous timestamped logger.
+- [x] Two switch processes connected directly by two data pipes.
+- [x] Supervisor restart with committed MAC state retained in shared memory.
+- [x] Lock benchmark, target-machine measurements, graph and generated analysis.
+- [x] Functional, memory and race checks for the scenarios listed in the verification record.
+- [ ] Final review of course-specific submission format, tracked files and final commit.
 
-## Project Overview
+Tests establish behavior for their scenarios; they do not prove that every possible schedule or hidden test is bug-free. See [verification](docs/VERIFICATION.md) and the [technical report](docs/REPORT.md).
 
-The switch is one server process with many threads. Each port has its own receiver thread, bounded output queues, and sender thread. The receiver reads complete frames, learns the source MAC, and decides which ports should get the frame. Each output port's sender writes to its own host, so a slow host does not delay the others.
+## Requirements
 
-Core behaviour:
+Linux, GCC, Bash and Python 3 are required. The C programs use libc/POSIX APIs, `-pthread` and `-lrt`. Valgrind is used for memory checks and GCC ThreadSanitizer for race checks. Matplotlib is required only when regenerating benchmark graphs.
 
-1. **Learn:** the source MAC of each incoming frame is recorded against the port it arrived on.
-2. **Forward:** a unicast to a known MAC goes only to that port.
-3. **Flood:** a broadcast (`FF:FF:FF:FF:FF:FF`) or a frame to an unknown MAC goes to every port except the one it came from, within the same VLAN.
-4. **Drop, don't block:** when a port's queue is full, the frame is dropped for that port and counted. The receiver never waits on a full queue.
-5. **Administer:** a separate `swctl` process changes port state, VLANs, and the MAC table while traffic is flowing.
+All shell commands below run from the repository root.
 
-## Key Features
-
-| Feature                    | Description                                                                                 |
-| -------------------------- | ------------------------------------------------------------------------------------------- |
-| Wire format                | Fixed 17-byte header with network-byte-order fields, followed by 0 to 1500 bytes of payload |
-| Partial I/O handling       | Loops over `read()` and `write()` so partial frames are reassembled                     |
-| Bounded per-port queues    | Mutex and condition variables, with a sender thread per port                                |
-| Shared broadcast frames    | Reference-counted frames shared across queues, freed by the last sender                     |
-| Striped MAC table          | Hash table with one lock per bucket, aging, LRU eviction, and a per-port MAC limit          |
-| Port admission control     | Counting semaphore with `sem_timedwait()` and a "switch full" reply on timeout            |
-| Weighted round-robin QoS   | Three priority queues per port (high, normal, low) with aging against starvation            |
-| Token-bucket rate limiting | Timer-driven refill and `pthread_cond_timedwait()`                                        |
-| VLANs and trunk port       | Per-port VLAN isolation, with the `vlan` field kept on the trunk                          |
-| Port mirroring             | Copy of a port's traffic sent to a sniffer port without slowing the source                  |
-| Live reconfiguration       | Shutdown, bring-up, VLAN change, and MAC clearing while traffic flows                       |
-| `swctl` admin tool       | UNIX domain socket control, plus `stats --watch` from shared memory                       |
-| Signal handling            | Dedicated `sigwait()` thread for `SIGINT`, `SIGHUP`, and `SIGUSR1`                  |
-| Asynchronous logging       | Logger thread that writes timestamped messages off the fast path                            |
-
-## Architecture
-
-### Processes
-
-The project is several processes. The switch is a single process with many threads.
-
-```mermaid
-flowchart LR
-    HA["host process<br/>./host ... 02:00:00:00:00:0A"] -- "TCP" --- P1["switch port 1"]
-    HB["host process<br/>./host ... 02:00:00:00:00:0B"] -- "TCP" --- P2["switch port 2"]
-    HC["host process<br/>./host ... 02:00:00:00:00:0C"] -- "TCP" --- P3["switch port 3"]
-
-    P1 --- SW["switch process<br/>./switch 9000 8<br/>one process, many threads"]
-    P2 --- SW
-    P3 --- SW
-
-    ADM["admin process<br/>./swctl show mac"] -- "UNIX socket" --- SW
-    SW -- "writes" --> SHM[("shared memory<br/>per-port counters")]
-    SHM -. "stats --watch reads" .-> ADM
-    SW -- "writes" --> LOG["switch.log"]
-    CFG["switch.conf"] -- "read" --> SW
-    SIGS["kill from a terminal<br/>SIGINT, SIGHUP, SIGUSR1"] -- "signals" --> SW
-```
-
-- **Host:** a client process that sends and receives frames over TCP. It is written for testing, and the course test hosts are used for marking.
-- **Switch:** the server process. It listens on a TCP port, and each accepted connection takes one switch port.
-- **swctl:** a second client for administration. It talks over a UNIX domain socket and reads counters from shared memory.
-
-### Threads and data flow
-
-Each port has a receiver thread and a sender thread. Helper threads support them.
-
-```mermaid
-flowchart LR
-    HA["Host A"] -- "frames" --> R1["Port 1 receiver"]
-    R1 -- "learn, look up" --> MAC[("MAC table<br/>striped locks")]
-    R1 -- "enqueue" --> Q2["Port 2 queues<br/>bounded"]
-    R1 -- "enqueue" --> Q3["Port 3 queues<br/>bounded"]
-    Q2 --> S2["Port 2 sender"] -- "write" --> HB["Host B"]
-    Q3 --> S3["Port 3 sender"] -- "write" --> HC["Host C"]
-    AG["Aging thread"] -- "removes old MACs" --> MAC
-    TM["Token timer"] -. "refills tokens" .-> S2
-    TM -. "refills tokens" .-> S3
-    LOG["Logger thread"] -- "writes" --> FILE["switch.log"]
-```
-
-Helper threads, one of each:
-
-| Thread      | Job                                             |
-| ----------- | ----------------------------------------------- |
-| Accept      | Accepts a new host, and assigns it a new port   |
-| Aging       | Removes MAC entries not seen for T seconds      |
-| Token timer | Refills the rate-limit tokens                   |
-| Signals     | Runs the `sigwait()` loop                     |
-| Admin       | Handles `swctl` commands over the UNIX socket |
-| Logger      | Writes queued log messages to the log file      |
-
-### Components
-
-| File                             | Responsibility                                                         |
-| -------------------------------- | ---------------------------------------------------------------------- |
-| `frame.h`, `frame.c`         | Header layout, validation, serialization, and deserialization          |
-| `mac_table.h`, `mac_table.c` | Striped hash table, aging, LRU eviction, and port security             |
-| `switch.c`                     | TCP listener, port admission, and switch lifecycle                     |
-| `port.c`                       | Per-port receiver and sender threads, rate limiting, and scheduling    |
-| `queue.c`                      | Bounded queues, priority levels, and reference-counted frame ownership |
-| `host.c`                       | TCP test host that sends and receives frames                           |
-| `swctl.c`                      | Admin client that talks to the switch over a UNIX domain socket        |
-| `main.c`                       | Standalone tests for the header and concurrent MAC table               |
-
-## Project Structure
-
-```text
-virtual-switch/
-├── frame.h          # Wire header definition and API
-├── frame.c          # Header serialization and validation
-├── mac_table.h      # Striped MAC table API
-├── mac_table.c      # Hash table, aging, eviction, port security
-├── switch.c         # Listener, admission control, lifecycle
-├── port.c           # Port receiver and sender threads
-├── queue.c          # Bounded queues and frame reference counting
-├── host.c           # Test host client
-├── swctl.c          # Admin tool
-├── main.c           # Standalone header and MAC table tests
-├── Makefile         # Build targets
-├── switch.conf      # Sample configuration
-├── tests/           # Test scripts and cases
-├── report.pdf       # Final report
-└── README.md
-```
-
-## Technologies Used
-
-| Category     | Technology                                                                      |
-| ------------ | ------------------------------------------------------------------------------- |
-| Language     | C (C11)                                                                         |
-| Compiler     | GCC                                                                             |
-| Build        | GNU Make                                                                        |
-| Concurrency  | POSIX threads, mutexes, condition variables, `sem_timedwait`                  |
-| IPC          | TCP sockets, UNIX domain sockets, shared memory with `PTHREAD_PROCESS_SHARED` |
-| Signals      | POSIX signals with a dedicated `sigwait()` thread                             |
-| Verification | Valgrind (memcheck), GCC ThreadSanitizer (`-fsanitize=thread`)                |
-
-## Prerequisites
-
-- Linux with POSIX APIs
-- GCC with C11 support
-- GNU Make
-- POSIX threads (`-pthread`)
-- Valgrind and GCC ThreadSanitizer support, for verification
-
-Check your toolchain:
+## Build
 
 ```bash
-gcc --version
-make --version
-valgrind --version
+bash bonus/two_switches/build.sh
+bash bonus/supervisor/build_recovery.sh
 ```
 
-## Installation & Setup
+These build the ordinary `switch` and `swctl`, the pipe launcher, supervisor/probe and focused checks. Output binaries under `build/` are generated files. The build scripts explicitly list source files and use C11, warnings-as-errors, debug symbols and pthreads. There is no required Makefile target in this version.
+
+Optional demonstration host:
 
 ```bash
-git clone https://github.com/ShajiaSiddiqa/virtual-switch.git
-cd virtual-switch
-ls
+gcc -std=c11 -Wall -Wextra -Werror -g -O0 -Iinc -pthread \
+    src/host.c src/frame_io.c src/frame.c src/io.c -o host
 ```
 
-No dependencies beyond the standard C library and POSIX threads are required.
+## Quick start
 
-## Compilation & Execution
-
-### Compiler flags
-
-The course build uses:
+In terminal 1:
 
 ```bash
-gcc -std=c11 -Wall -Wextra -Werror -g -O0 -pthread
+./switch 9000 3
 ```
 
-Every file must build with these flags. Warnings are errors.
+Arguments are `<tcp_port> <num_ports>`: TCP port 1–65535 and 1–64 logical ports. A quiet terminal is normal; runtime events go to `switch.log`. Stop with Ctrl+C.
 
-### Build with Make
+In terminal 2:
 
 ```bash
-make          # build all programs
-make clean    # remove the programs and object files
+./swctl show ports
+./swctl show mac
+./swctl stats
+./swctl stats --watch
 ```
 
-### Build and run the header and MAC table test
-
-```bash
-gcc -std=c11 -Wall -Wextra -Werror -g -O0 -pthread \
-    main.c frame.c mac_table.c -o lab_test
-./lab_test
-```
-
-### Run the switch
-
-```bash
-./switch <tcp_port> <num_ports>
-./switch 9000 8
-```
-
-This listens on TCP port `9000` and creates eight switch ports.
-
-### Run a test host
-
-```bash
-./host <switch_ip> <tcp_port> <mac>
-./host 127.0.0.1 9000 02:00:00:00:00:01
-```
-
-### Check with Valgrind and ThreadSanitizer
-
-Run one tool per build. Do not run the ThreadSanitizer binary under Valgrind.
-
-```bash
-valgrind --leak-check=full ./switch 9000 8
-
-gcc -std=c11 -g -O1 -pthread -fsanitize=thread <all .c files> -o switch_tsan
-./switch_tsan 9000 8
-```
-
-## Usage Guide
-
-### 1. Start the switch
-
-```bash
-./switch 9000 8
-```
-
-### 2. Connect two hosts
-
-In two more terminals:
+The optional host sends one VLAN-1 broadcast containing `hello`, then disconnects:
 
 ```bash
 ./host 127.0.0.1 9000 02:00:00:00:00:01
-./host 127.0.0.1 9000 02:00:00:00:00:02
 ```
 
-TODO: describe the host's input syntax for sending frames.
+It is not an interactive send/receive CLI. The integration tests use persistent Python socket hosts and validate complete binary frames.
 
-### 3. Test forwarding
-
-1. Send a frame from `02:00:00:00:00:01` to `02:00:00:00:00:02`. The destination is unknown, so the switch floods the frame to every other port.
-2. Send a reply from `02:00:00:00:00:02` to `02:00:00:00:00:01`. The switch learns the port of `…:02`.
-3. Send again from `…:01` to `…:02`. The frame now goes only to the port of `…:02`.
-4. Send to `FF:FF:FF:FF:FF:FF` to test broadcast.
-
-### 4. Administer the switch
-
-`swctl` talks to the running switch over a UNIX domain socket.
-
-| Command                                  | Purpose                                                                     |
-| ---------------------------------------- | --------------------------------------------------------------------------- |
-| `./swctl show mac`                     | List learned MAC entries                                                    |
-| `./swctl show ports`                   | Show port status and VLAN assignments                                       |
-| `./swctl shutdown <port>`              | Shut down a port, and clean up its workers and queue                        |
-| `./swctl up <port>`                    | Bring a port back into service                                              |
-| `./swctl vlan <port> <vlan>`           | Change a port's VLAN                                                        |
-| `./swctl mirror <port> <sniffer_port>` | Copy a port's traffic to a sniffer port, for example `./swctl mirror 3 7` |
-| `./swctl clear mac`                    | Clear learned MAC entries                                                   |
-| `./swctl stats`                        | Show per-port frames in, out, dropped, and mirrored                         |
-| `./swctl stats --watch`                | Refresh the counters every second                                           |
-
-### 5. Signals
-
-| Signal      | Action                                                                 |
-| ----------- | ---------------------------------------------------------------------- |
-| `SIGINT`  | Clean shutdown: join every thread, close every socket, free all memory |
-| `SIGHUP`  | Reload `switch.conf` without restarting                              |
-| `SIGUSR1` | Dump the MAC table to a file                                           |
+For an automated example that starts/stops its own switch:
 
 ```bash
-kill -HUP  $(pidof switch)
-kill -USR1 $(pidof switch)
-kill -INT  $(pidof switch)
+bash tests/basic_forward.sh
 ```
 
-## Configuration
+## Administration
 
-The switch reads `switch.conf` from the working directory. Each line is `key=value`. The spec requires a config file but leaves the keys to the implementation, so the keys below are a sample. Replace them with the keys the code actually reads.
+User-facing port numbers are one-based. The internal table uses zero-based slots.
 
-```ini
-mac_age_seconds=60
-mac_table_capacity=256
-max_macs_per_port=16
-port_wait_ms=5000
-queue_capacity=64
-rate_frames_per_second=100
-default_vlan=1
-trunk_port=4
-admin_socket=/tmp/virtual-switch.sock
-log_file=switch.log
-mac_dump_file=mac-table.txt
+| Command | Behavior |
+| --- | --- |
+| `./swctl show ports` | State, VLAN, access/trunk/sniffer mode and mirror destination |
+| `./swctl show mac` | MAC, logical port and VLAN |
+| `./swctl clear mac` | Clear the table; supervised mode commits before success reply |
+| `./swctl shutdown 2` | Disable slot 2, cancel I/O, discard queued references and join its session |
+| `./swctl up 2` | Enable admission to slot 2; the old TCP client must reconnect |
+| `./swctl vlan 2 20` | Make slot 2 an access port in VLAN 20 |
+| `./swctl trunk 4` | Select slot 4 as the sole trunk |
+| `./swctl trunk 0` | Disable the configurable trunk |
+| `./swctl mirror 1 3` | Mirror accepted ingress from slot 1 to dedicated sniffer slot 3 |
+| `./swctl mirror 1 0` | Disable mirroring from slot 1 |
+| `./swctl stats` | Snapshot counters directly from shared memory |
+| `./swctl stats --watch` | Refresh the shared-memory counters every second; Ctrl+C stops watch |
+
+An access port must send frames with its assigned VLAN. The trunk preserves the VLAN field. A sniffer can intentionally observe mirrored traffic across VLANs, is excluded from ordinary forwarding, and cannot inject ordinary traffic. Mirroring covers accepted ingress, not a second independent egress capture.
+
+## Configuration and signals
+
+The reload configuration is **one integer**, not `key=value` settings. `SIGHUP` changes MAC aging only. Startup uses the compiled default until reload.
+
+```bash
+printf '30\n' > vswitch.conf
+kill -HUP <actual-switch-pid>
+kill -USR1 <actual-switch-pid>
+kill -INT <actual-switch-pid>
 ```
 
-## Wire Protocol
+Replace the angle-bracket placeholder with one actual PID. SIGUSR1 writes `mac_dump.txt`; SIGINT requests coordinated shutdown. Do not target every process named `switch` when running multiple instances.
 
-Every frame is a 17-byte header followed by 0 to 1500 bytes of payload. The `length` field counts payload bytes only.
+| Default | Value |
+| --- | ---: |
+| MAC age / sweep interval | 5 s / 1 s |
+| MAC buckets / table capacity | 16 / 256 |
+| Validated MAC/VLAN keys per port | 4 |
+| Admission timeout | 2 s |
+| Priority values | 0 high, 1 normal, 2 low |
+| Queue capacity | 8 per priority, 24 per port |
+| Weighted schedule / overdue threshold | 5:3:1 / 100 ms |
+| Rate / initial burst | 1000 frames/s / 10 tokens |
+| Refill cadence | approximately 10 ms |
+| Logger capacity / message storage | 64 records / 256 bytes per message |
 
-|    Offset | Field        |       Size | Meaning                                              |
-| --------: | ------------ | ---------: | ---------------------------------------------------- |
-|      0–1 | `length`   |          2 | Payload length, 0 to 1500                            |
-|      2–7 | `src`      |          6 | Source MAC address                                   |
-|     8–13 | `dst`      |          6 | Destination MAC (`FF:FF:FF:FF:FF:FF` is broadcast) |
-|    14–15 | `vlan`     |          2 | VLAN number, 1 to 4094                               |
-|        16 | `priority` |          1 | `0` high, `1` normal, `2` low                  |
-| 17 onward | payload      | `length` | Frame data                                           |
+Queue-aging fairness requires the port's sender to make progress. The token bucket permits a burst; it is not a strict fixed-window counter.
 
-`length` and `vlan` are multi-byte fields in network byte order. Convert them with `htons` when sending and `ntohs` when receiving.
+Instance environment options must be set before workers start:
 
-Three traps to avoid:
+| Environment | Default/purpose |
+| --- | --- |
+| `VSWITCH_SOCKET` | `/tmp/vswitch.sock`; also used by `swctl` |
+| `VSWITCH_STATS` | `/vswitch_stats`; also used by statistics commands |
+| `SWITCH_LOG_PATH` | `switch.log` |
+| `SWITCH_DUMP_PATH` | `mac_dump.txt` |
+| `SWITCH_CONFIG_PATH` | `vswitch.conf` |
+| `VSWITCH_MAC_STORE` | Optional supervisor-owned recovery object; normally set by supervisor |
 
-- **Partial reads.** TCP is a byte stream. One `read()` can return part of a frame, or more than one frame. Read the 17-byte header first, take `length` from it, then read exactly that many payload bytes.
-- **Byte order.** Convert `length` and `vlan` with `ntohs` and `htons`.
-- **Struct padding.** A C struct with these fields has `sizeof` 18, not 17. Read into a byte buffer and unpack the fields.
+`VSWITCH_NAME` alone does not configure the switch; shell tests may derive the two actual IPC settings from their own test identifier.
 
-## Technical Details
+## Wire protocol
 
-### Data structures
+The header is 17 bytes followed by `length` payload bytes.
 
-- **Frame header:** a fixed 17-byte layout.
-- **Striped MAC table:** an array of buckets, each with its own mutex. A MAC hashes to one bucket, so two receivers only contend when they hit the same bucket. Entries record the port, last-seen time, and LRU position.
-- **Port queues:** three bounded FIFOs (high, normal, low) per port, each protected by a mutex and two condition variables.
-- **Shared frames:** a reference-counted buffer. The count is set to the number of queues the frame actually entered, so a dropped copy does not count. The last sender to finish frees the frame. The count is changed and checked for zero under a mutex.
+| Byte offset | Field | Bytes | Valid values |
+| ---: | --- | ---: | --- |
+| 0 | length | 2 | 0–1500; payload length only |
+| 2 | source MAC | 6 | Six address bytes |
+| 8 | destination MAC | 6 | Six address bytes |
+| 14 | VLAN | 2 | 1–4094 |
+| 16 | priority | 1 | 0–2 |
 
-### Concurrency primitives
+Length and VLAN are network byte order. Python tests use `struct.pack("!H6s6sHB", ...)`. TCP and pipes are byte streams; one read/write is not assumed to transfer a complete frame. See `frame.c`, `io.c`, `frame_io.c` and `pipe_link.c`.
 
-| Primitive                                   | Used for                                     |
-| ------------------------------------------- | -------------------------------------------- |
-| Striped mutexes                             | MAC table buckets                            |
-| Mutex and condition variables               | Port queues and token waits                  |
-| Counting semaphore (`sem_timedwait`)      | Port admission with a timeout                |
-| `PTHREAD_PROCESS_SHARED` mutex            | Counters in shared memory, read by `swctl` |
-| `sigwait()` on a dedicated thread         | Signal handling                              |
-| Timer thread and `pthread_cond_timedwait` | Token-bucket refill                          |
+## Bonus: two switches
 
-### Admission control
-
-The semaphore starts at the number of ports. Each new host takes one with `sem_wait`, and each host that leaves gives one back with `sem_post`. A new host waits with `sem_timedwait`. If no port frees up in time, the host gets a "switch full" reply and is disconnected.
-
-### MAC table
-
-- **Aging:** a thread removes entries not seen for T seconds.
-- **Host moved:** a known MAC arrives on a new port. Update the entry and log `MAC moved: port X -> port Y`.
-- **Capacity:** the table holds at most K entries. When it is full, the least recently used entry is removed.
-- **Port security:** more than M MACs on one port indicates MAC flooding. That port is shut down.
-
-### Scheduling
-
-Each sender uses weighted round robin across its three priority queues, for example 5:3:1. Aging is added on top: a low-priority frame that has waited too long, for example 200 ms, is sent next, whatever the weights say. Low-priority frames are never starved.
-
-### Rate limiting
-
-Each port has a token bucket. A timer thread adds tokens at the configured rate. Sending one frame spends one token. A sender with no tokens waits with `pthread_cond_timedwait`, never with `sleep()` and never in a spin loop.
-
-### Live reconfiguration and shutdown
-
-`swctl shutdown <port>` runs while traffic flows:
-
-1. Mark the port down, so no receiver queues new frames for it.
-2. Set `closing` and broadcast the condition variable, so a sleeping sender wakes up.
-3. Drop the frames still in the port's queue. Lower the refcount of each one.
-4. Call `shutdown()` on the socket, so the blocked `read()` in the receiver returns.
-5. Join both threads, free the port, and `sem_post` the free-port semaphore.
-
-### Lock order
-
-Commands such as `clear mac` or `vlan 3 20` take several locks. If two threads take the same locks in different orders, they can deadlock. The project uses one order everywhere. The report must state it.
-
-1. The port table lock
-2. Port locks, lowest port number first
-3. MAC bucket locks, lowest bucket first
-4. The stats mutex, always last
-
-### Signals
-
-Signals are blocked before any thread is created, so every thread inherits the mask. A single signal thread then receives them with `sigwait()`. No signal handlers are used, so that thread may lock mutexes and call any function.
-
-### Correctness rules
-
-- No busy waiting. Do not use `while (!flag);`.
-- No `sleep()` for synchronisation.
-- Check the return value of every system call and library call that can fail.
-- Never hold a lock during a `write()` to a socket.
-- `SIGPIPE` is ignored, and `EPIPE` is handled, so a host that disconnects mid-write does not crash the switch.
-- The switch is clean under Valgrind and ThreadSanitizer.
-
-## Code Examples
-
-### Bounded queue: receiver and sender
-
-The receiver never waits. It drops the frame when the queue is full.
-
-```c
-/* receiver: never waits */
-pthread_mutex_lock(&q->lock);
-if (q->count == q->cap) {
-    q->dropped++;            /* full: drop */
-    pthread_mutex_unlock(&q->lock);
-    return;
-}
-q->item[q->tail] = f;
-q->tail = (q->tail + 1) % q->cap;
-q->count++;
-pthread_cond_signal(&q->not_empty);
-pthread_mutex_unlock(&q->lock);
+```bash
+./build/two_switches 9200 9201 3
 ```
 
-The sender sleeps on the condition variable while the queue is empty. It writes outside the lock.
+Each process has two host slots and a reserved pipe trunk at port 3. Exactly two inter-process data pipes carry both directions; each process also has local wake pipes for cancellation. Fork/exec occurs before switch workers start.
 
-```c
-/* sender: sleeps while empty */
-pthread_mutex_lock(&q->lock);
-while (q->count == 0 && !q->closing)
-    pthread_cond_wait(&q->not_empty, &q->lock);
-if (q->closing) { ... }       /* port shut down */
-f = q->item[q->head];
-q->head = (q->head + 1) % q->cap;
-q->count--;
-pthread_mutex_unlock(&q->lock);
-write_full(sock, f, ...);       /* outside the lock */
+The launcher prints distinct admin and statistics names. Use those actual values, for example:
+
+```bash
+VSWITCH_SOCKET=/tmp/vswitch-12345-a.sock ./swctl show mac
+VSWITCH_STATS=/vswitch_12345_a_stats ./swctl stats
 ```
 
-### Port admission with a timeout
+`12345` is an example launcher PID. The physical pipe trunk is fixed for that launch and cannot be disabled, reassigned or used as a mirror source. Ctrl+C to the launcher stops/reaps both switches. See [two-switch details](bonus/two_switches/README.md).
 
-```c
-struct timespec t;
-clock_gettime(CLOCK_REALTIME, &t);
-t.tv_sec += 5;                  /* wait at most 5 s */
-if (sem_timedwait(&free_ports, &t) == -1) {
-    if (errno == ETIMEDOUT)
-        send_switch_full(sock);
-    close(sock);
-}
+## Bonus: supervisor and MAC recovery
+
+```bash
+./build/switch_supervisor ./switch 9300 3
 ```
 
-### Blocking signals and the signal thread
+The parent retains a shared MAC recovery image, restarts abnormal worker exits and gives replacements the same object name. The default limit is five replacements, with 250 ms backoff and a five-second graceful-stop deadline. The supervisor prints the per-instance socket/statistics names. SIGINT/SIGTERM stops it; SIGHUP/SIGUSR1 forwards to its active worker.
 
-```c
-/* main(), BEFORE creating any thread */
-sigset_t set;
-sigemptyset(&set);
-sigaddset(&set, SIGINT);
-sigaddset(&set, SIGHUP);
-sigaddset(&set, SIGUSR1);
-pthread_sigmask(SIG_BLOCK, &set, NULL);
-/* every thread created now inherits the mask */
+Committed MAC/VLAN, slot, aging timestamp and LRU data survive a worker crash. TCP sessions and administrative policy do not. Recovered mappings are visible but treated as unknown destinations until source relearning validates them; this prevents stale known-unicast selection after slot reuse. Shared memory survives worker crashes while the parent lives, not machine power loss.
+
+The supervisor manages a standalone switch. It is not combined with the two-switch pipe launcher. See [live recovery](bonus/supervisor/LIVE_RECOVERY.md).
+
+## Bonus: benchmark
+
+```bash
+mkdir -p build
+gcc -std=c11 -Wall -Wextra -Werror -O2 -g -pthread \
+    bonus/benchmark/lock_bench.c -o build/lock_bench
+python3 bonus/benchmark/check_benchmark.py
+python3 bonus/benchmark/run_benchmark.py --ops 5000000 --repeats 3
 ```
 
-```c
-/* the signal thread */
-for (;;) {
-    int sig;
-    sigwait(&set, &sig);
-    if (sig == SIGINT)  start_shutdown();
-    if (sig == SIGHUP)  reload_config();
-    if (sig == SIGUSR1) dump_mac_table();
-}
+Keep `results/benchmark/` tracked: `raw.csv`, `summary.csv`, `metadata.json`, `throughput.png`, `throughput.pdf` and `report.md`. The graph/report contain native target-machine measurements. This is a table-operation microbenchmark, not whole-switch packet throughput. It excludes lookup-side LRU mutation and the supervised checkpoint path. See [benchmark scope](bonus/benchmark/README.md).
+
+## Verification
+
+Do not leave a manual default-instance switch running when executing integration tests that use its default IPC names. Run those tests sequentially. Random TCP ports reduce but do not eliminate collisions.
+
+```bash
+bash tests/basic_forward.sh
+TIER1_PORT=9400 python3 tests/tier1_verify.py \
+    valgrind --leak-check=full --show-leak-kinds=all \
+    --errors-for-leak-kinds=all --error-exitcode=99 ./switch
+VLAN_TEST_PORT=9410 python3 tests/vlan_integration.py
+MIRROR_TEST_PORT=9420 python3 tests/mirror_integration.py
+PORT_ADMIN_TEST_PORT=9430 python3 tests/port_admin_integration.py
+LOGGER_TEST_PORT=9440 python3 tests/logger_integration.py
+TWO_SWITCH_TEST_PORT=9450 python3 tests/two_switch_integration.py
 ```
 
-### Socket setup
+Recovery tests use a separate fixture binary with a 60-second MAC age and one-MAC active limit:
 
-```c
-/* server: the switch */
-int s = socket(AF_INET, SOCK_STREAM, 0);
-bind(s, (struct sockaddr *)&addr, sizeof addr);
-listen(s, 16);
-for (;;) {
-    int c = accept(s, NULL, NULL);
-    /* c is one host = one port */
-}
+```bash
+./build/mac_recovery_check
+PORT=9300 bash tests/supervisor_recovery.sh
 ```
 
-```c
-/* client: a host */
-int s = socket(AF_INET, SOCK_STREAM, 0);
-connect(s, (struct sockaddr *)&addr, sizeof addr);
-write(s, frame, 17 + len);
-read_full(s, header, 17);
+Separate ordinary TSan build:
+
+```bash
+gcc -std=c11 -Wall -Wextra -Werror -g -O0 -Iinc -pthread \
+    -fsanitize=thread src/switch.c src/mac_store.c src/pipe_link.c \
+    src/async_logger.c src/rate_limit.c src/signal_control.c src/control.c \
+    src/frame_queue.c src/shared_frame.c src/frame_io.c src/frame.c \
+    src/io.c src/mac_table.c src/shm_stats.c -lrt -o build/switch_tsan
+setarch "$(uname -m)" -R env TSAN_OPTIONS=halt_on_error=1 \
+    SWITCH="$PWD/build/switch_tsan" bash tests/basic_forward.sh
 ```
 
-Set `SO_REUSEADDR` on the server. Without it, after a crash `bind()` can fail for a minute with "Address already in use".
+ASLR disabling is the workaround used for this machine's TSan mapping issue. It is not a requirement of switch operation. Never combine Valgrind with a TSan executable. Recovery-specific TSan commands are in `bonus/supervisor/LIVE_RECOVERY.md`.
 
-### Reading a complete frame
+## Source map
 
-```c
-/* returns n, 0 if the peer closed, -1 on error */
-ssize_t read_full(int fd, void *buf, size_t n)
-{
-    size_t got = 0;
-    while (got < n) {
-        ssize_t r = read(fd, (char *)buf + got, n - got);
-        if (r == 0) return 0;
-        if (r < 0) {
-            if (errno == EINTR) continue;
-            return -1;
-        }
-        got += r;
-    }
-    return got;
-}
-```
+| Location | Responsibility |
+| --- | --- |
+| `inc/` | Public headers and data structures |
+| `src/frame.c`, `src/io.c`, `src/frame_io.c` | Wire validation and complete transfers |
+| `src/shared_frame.c`, `src/frame_queue.c` | Atomic ownership and bounded QoS queues |
+| `src/mac_table.c`, `src/mac_store.c` | Live MAC hash table and crash-consistent recovery image |
+| `src/rate_limit.c` | Per-session token bucket/refill worker |
+| `src/control.c`, `src/swctl.c`, `src/shm_stats.c` | Management and shared telemetry |
+| `src/signal_control.c`, `src/async_logger.c` | Synchronous signal worker and asynchronous logging |
+| `src/pipe_link.c` | Cancellable two-pipe transport |
+| `src/switch.c` | Main accept loop, port sessions, policy and lifecycle |
+| `src/host.c` | Send-only demonstration client |
+| `tests/` | Unit, shell and Python integration checks; keep tracked |
+| `bonus/` | Benchmark, pipe launcher, supervisor and supporting documentation |
+| `results/benchmark/` | Measured benchmark artifacts; keep tracked |
+| `docs/` | Technical report and verification record |
+| `build/` | Generated binaries/logs; ignore |
 
-## Testing
+## Limitations
 
-- **Public tests (released separately):** a basic forwarding script and a broadcast script. The switch must pass both.
-- **Hidden tests:** slow and misbehaving hosts, a host that connects and never reads, many hosts at once, and admin commands and signals while traffic flows.
-- **Tools:** run the switch under Valgrind and ThreadSanitizer, using separate builds.
+There is no Ethernet NIC/TAP integration, spanning-tree protocol, authentication for TCP hosts or interactive production host CLI. Reload changes MAC age only. The global ports lock and MAC capacity operations can serialize work; supervised whole-image checkpoints add further synchronization/copy cost. Mirror capture is ingress-only. Logger contention can drop records by design, counted separately from submission errors. Counter values describe their implemented events, not guaranteed end-to-end delivery.
+
+Some administrative operations serialize with admission, which can be waiting up to its timeout. Some VLAN/mirror changes wait for affected senders' transmit locks; TCP writes have a timeout, while the fixed pipe trunk is excluded from incompatible reconfiguration. These bounds and restrictions are part of the implementation, not claims of zero-latency administration.

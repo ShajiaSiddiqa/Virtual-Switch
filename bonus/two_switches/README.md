@@ -150,28 +150,7 @@ No additional fast-path global lock was introduced. The existing ports, queue,
 rate-limiter, transmit and MAC lock ordering remains applicable. Pipe cancellation
 requires no transmit lock; shutdown can wake a sender stalled in poll.
 
-## Verification status
-
-Passed on the Ubuntu development machine:
-
-- Standalone pipe transport and inherited-descriptor adoption.
-- Independent shared-memory statistics and owner-specific cleanup.
-- Two-process forwarding, VLAN isolation, and VLAN-specific MAC learning.
-- Cross-switch unicast with preserved VLAN, priority, and payload.
-- Launcher fork/exec, signal forwarding, child reaping, and failure handling.
-- Full TCP/admin integration and IPC resource cleanup.
-- Valgrind: zero errors and zero remaining allocations in the parent
-  and both child processes of two_switch_pipe_check.
-- ThreadSanitizer: full two-switch integration passed without race warnings.
-
-The partial-frame shutdown test intentionally produces a protocol-error
-diagnostic. The asynchronous logger may drop messages under contention
-according to its nonblocking policy.
-
-These results cover the tested scenarios; they do not prove the absence
-of every possible concurrency defect.
-
-The supervisor and persistent-MAC integration are separate bonus wor
+## Alternatives and tradeoffs
 
 A socketpair would provide a bidirectional descriptor and socket shutdown, but the
 assignment explicitly requires two pipes. A TCP relay could reuse frame_io but
@@ -182,15 +161,19 @@ Reference counts remain process-local. Frames crossing the link are serialized
 bytes and reconstructed on receipt; sharing heap addresses between the processes
 would be invalid. Broadcast copies within either switch still share one allocation.
 
-## Verification status at delivery
+## Verification status
 
-Passed locally: strict compilation; pipe transport/adoption; forked two-switch
-real-port-session forwarding and shutdown; independent shared-memory instances;
-launcher fork/exec, pipe ownership, signal forwarding and reaping; existing QoS,
-VLAN, mirror, shared statistics and port lifecycle checks. AddressSanitizer and
-UndefinedBehaviorSanitizer passed the forked session test with LeakSanitizer disabled.
+Development-machine checks passed for standalone pipe transport/adoption,
+independent statistics, forked real port sessions, launcher fork/exec and cleanup,
+and full TCP/admin forwarding with VLAN-aware remote MAC learning. The forked
+port-session Memcheck run reported zero errors/leaks in parent and children.
+Full two-switch integrations passed normally and with ThreadSanitizer.
 
-The delivery environment forbids network listeners and has no Valgrind installed.
-The full TCP/admin integration test and local Valgrind runs are supplied for the
-Ubuntu development machine. No claim of complete validation is made until those
-pass. Keep the prior Tier 1/Tier 2 regression tests in the repository.
+After live-recovery code changes, the ordinary pair was rebuilt and passed again
+normally on ports 9450/9451 and under current-code TSan on ports 9480/9481. No race
+warnings were reported. Small counted logger drops are allowed by logger policy.
+See [verification record](../../docs/VERIFICATION.md) for scope and limits.
+
+The build script now links mac_store.c because switch main supports optional
+recovery. This pair is a separate mode from the standalone-switch supervisor;
+combined supervised pipe-pair restart is not implemented.

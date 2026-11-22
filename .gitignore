@@ -1,26 +1,14 @@
-
-# Ignore object files
+# Generated build tree and root executables
+/build/
+/switch
+/host
+/swctl
+/lab_test
+/switch_tsan
+/race_tsan
 *.o
-
-# Ignore PDF files
-*.pdf
-
-# Ignore HTML files
-*.html
-
-# Compiled objects and binaries
-*.o
-*.out
 *.a
 *.so
-switch
-host
-swctl
-lab_test
-switch_tsan
-race_tsan
-
-# Debug symbols and sanitizer/valgrind output
 *.dSYM/
 *.gcda
 *.gcno
@@ -28,26 +16,26 @@ vgcore.*
 callgrind.out.*
 massif.out.*
 
-# Runtime files created by the switch
-switch.log
-mac-table.txt
+# Runtime output and local overrides
+*.log
 *.sock
-
-# Local config overrides (keep switch.conf as the tracked sample)
+/mac_dump.txt
+/mac-table.txt
 switch.local.conf
 
-# Editor and OS files
+# Python caches and benchmark virtual environment
+__pycache__/
+*.pyc
+/.venv-benchmark/
+
+# Local update archives, backups and editor state
+/*.tar.gz
+*.bak
 .vscode/
 .idea/
 *.swp
 *~
 .DS_Store
-*.log
 
-/build/
-/mac_dump.txt
-/src/*.bak
-/inc/*.bak
-
-# Downloaded update archives and local backups
-/*.tar.gz
+# Keep tests/, bonus/, docs/ and results/benchmark/ tracked.
+# Do not globally ignore PDF/HTML: graphs and project references may use them.
