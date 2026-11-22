@@ -177,7 +177,7 @@ static int release_resources(ControlServer *server, int owns_path)
 {
     int saved = 0;
 
-    if (owns_path && unlink(CONTROL_SOCKET_PATH) == -1) {
+    if (owns_path && unlink(server->socket_path) == -1) {
         saved = errno;
     }
 
@@ -226,6 +226,12 @@ int control_start_logged(ControlServer *server, ControlHandler handler, void *co
     };
 
     int owns_path = 0;
+    const char *path = control_socket_path();
+    if (path[0] == '\0' || strlen(path) >= sizeof(server->socket_path)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    memcpy(server->socket_path, path, strlen(path) + 1);
 
     if (pipe(server->wake_pipe) == -1) 
         goto fail;
@@ -239,19 +245,19 @@ int control_start_logged(ControlServer *server, ControlHandler handler, void *co
 
     struct sockaddr_un address = {.sun_family = AF_UNIX};
 
-    if (sizeof(CONTROL_SOCKET_PATH) > sizeof(address.sun_path)) {
+    if (strlen(server->socket_path) >= sizeof(address.sun_path)) {
         errno = ENAMETOOLONG;
         goto fail;
     }
 
-    memcpy(address.sun_path, CONTROL_SOCKET_PATH, sizeof(CONTROL_SOCKET_PATH));
+    memcpy(address.sun_path, server->socket_path, strlen(server->socket_path) + 1);
 
     if (bind(server->listener, (struct sockaddr *)&address, sizeof(address)) == -1) 
         goto fail;
 
     owns_path = 1;
 
-    if (chmod(CONTROL_SOCKET_PATH, 0600) == -1 || listen(server->listener, 8) == -1) 
+    if (chmod(server->socket_path, 0600) == -1 || listen(server->listener, 8) == -1) 
         goto fail;
 
     int error = pthread_create(&server->thread, NULL, control_worker, server);

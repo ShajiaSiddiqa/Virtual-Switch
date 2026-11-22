@@ -1,0 +1,36 @@
+{
+  "created_utc": "2026-11-22T09:21:12.174262+00:00",
+  "platform": "Linux-6.8.0-149-generic-x86_64-with-glibc2.35",
+  "machine": "x86_64",
+  "python": "3.10.12 (main, Aug 31 2026, 10:18:17) [GCC 11.4.0]",
+  "logical_cpus": 8,
+  "affinity_cpus": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7
+  ],
+  "parameters": {
+    "binary": "./build/lock_bench",
+    "threads": [
+      1,
+      2,
+      4,
+      8
+    ],
+    "reads": [
+      80,
+      50
+    ],
+    "hot": 0,
+    "ops": 5000000,
+    "repeats": 3,
+    "out": "results/benchmark"
+  },
+  "compile_command": "gcc -std=c11 -Wall -Wextra -Werror -O2 -g -pthread bonus/benchmark/lock_bench.c -o build/lock_bench",
+  "compiler": "gcc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0"
+}

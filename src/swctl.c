@@ -55,12 +55,12 @@ static int run_control(const char *command)
 
     struct sockaddr_un address = {.sun_family = AF_UNIX};
 
-    if (sizeof(CONTROL_SOCKET_PATH) > sizeof(address.sun_path)) {
+    if (strlen(control_socket_path()) >= sizeof(address.sun_path)) {
         fprintf(stderr, "Control socket path is too long\n");
         goto cleanup;
     }
 
-    memcpy(address.sun_path, CONTROL_SOCKET_PATH, sizeof(CONTROL_SOCKET_PATH));
+    memcpy(address.sun_path, control_socket_path(), strlen(control_socket_path()) + 1);
 
     if (connect(fd, (struct sockaddr *)&address, sizeof(address)) == -1) {
         perror("connect control");

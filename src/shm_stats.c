@@ -5,6 +5,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <string.h>
+#include <stdlib.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -28,7 +29,7 @@ int shm_stats_close(StatsHandle *handle)
 
     int saved = 0;
 
-    if (handle->owner && shm_unlink(SHM_STATS_NAME) == -1) 
+    if (handle->owner && shm_unlink(handle->name) == -1) 
         saved = errno;
 
     if (handle->shared != NULL && munmap(handle->shared, sizeof(SharedStats)) == -1 && saved == 0) 
@@ -55,7 +56,16 @@ int shm_stats_create(StatsHandle *handle, size_t num_ports)
 
     *handle = (StatsHandle){.fd = -1};
 
-    handle->fd = shm_open(SHM_STATS_NAME, O_CREAT | O_EXCL | O_RDWR, 0600);
+    const char *name = getenv("VSWITCH_STATS");
+    if (name == NULL)
+        name = SHM_STATS_NAME;
+    if (name[0] != '/' || name[1] == '\0' || strchr(name + 1, '/') != NULL ||
+        strlen(name) >= sizeof(handle->name)) {
+        errno = EINVAL;
+        return -1;
+    }
+    memcpy(handle->name, name, strlen(name) + 1);
+    handle->fd = shm_open(handle->name, O_CREAT | O_EXCL | O_RDWR, 0600);
     if (handle->fd == -1) 
         return -1;
 
@@ -106,7 +116,16 @@ int shm_stats_attach(StatsHandle *handle)
     }
 
     *handle = (StatsHandle){.fd = -1};
-    handle->fd = shm_open(SHM_STATS_NAME, O_RDWR, 0);
+    const char *name = getenv("VSWITCH_STATS");
+    if (name == NULL)
+        name = SHM_STATS_NAME;
+    if (name[0] != '/' || name[1] == '\0' || strchr(name + 1, '/') != NULL ||
+        strlen(name) >= sizeof(handle->name)) {
+        errno = EINVAL;
+        return -1;
+    }
+    memcpy(handle->name, name, strlen(name) + 1);
+    handle->fd = shm_open(handle->name, O_RDWR, 0);
     if (handle->fd == -1) 
         return -1;
 

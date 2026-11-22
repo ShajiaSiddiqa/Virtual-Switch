@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include "io.h"
+#include "pipe_link.h"
 #include "async_logger.h"
 #include <stdarg.h>
 #include "control.h"
@@ -8,6 +9,7 @@
 #include "shm_stats.h"
 #include "frame_queue.h"
 #include <poll.h>
+#include <limits.h>
 #include <time.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -107,6 +109,7 @@ static int parse_number(const char *text, long max)
 
 typedef struct Port {
     int fd;
+    PipeLink *pipe_link; /* Reserved physical trunk; never reused by TCP admission. */
     int num_ports;
     RateLimit limiter;
     sem_t *free_ports;
@@ -257,6 +260,13 @@ static int change_vlan_policy(AdminContext *admin, int number, int vlan,
         return admin_message(response, capacity, "Disable mirroring to this sniffer first\n", -1);
     }
 
+    for (int i = 0; i < admin->num_ports; i++) {
+        if (admin->ports[i].pipe_link != NULL &&
+            ((trunk_command && number != i + 1) || (!trunk_command && number == i + 1))) {
+            pthread_mutex_unlock(admin->ports_lock);
+            return admin_message(response, capacity, "Pipe trunk is fixed for this launch\n", -1);
+        }
+    }
     /* Only the single admin thread changes these policy fields. */
     if (trunk_command) {
         for (int i = 0; i < admin->num_ports; i++)
@@ -344,7 +354,7 @@ static int change_mirror(AdminContext *admin, int source, int target,
     if (pthread_mutex_lock(admin->ports_lock) != 0)
         abort();
     Port *port = &admin->ports[source - 1];
-    if (port->sniffer || source == target ||
+    if (port->pipe_link != NULL || port->sniffer || source == target ||
         (target != 0 && (admin->ports[target - 1].trunk ||
                         admin->ports[target - 1].mirror_target != 0))) {
         if (pthread_mutex_unlock(admin->ports_lock) != 0)
@@ -410,7 +420,7 @@ static int change_mirror(AdminContext *admin, int source, int target,
 }
 
 static void join_worker(pthread_t thread);
-static void stop_port_io(int fd);
+static void stop_port_io(Port *port);
 
 /* Admission lock serializes semaphore/slot changes and session joins. */
 static int set_port_state(AdminContext *admin, int number, int up,
@@ -418,6 +428,8 @@ static int set_port_state(AdminContext *admin, int number, int up,
 {
     int index = number - 1;
     Port *port = &admin->ports[index];
+    if (port->pipe_link != NULL)
+        return admin_message(response, capacity, "Pipe trunk is fixed for this launch\n", -1);
     if (pthread_mutex_lock(admin->admission_lock) != 0)
         abort();
     if (pthread_mutex_lock(admin->ports_lock) != 0)
@@ -453,7 +465,7 @@ static int set_port_state(AdminContext *admin, int number, int up,
                     record_stats(port, STATS_FRAMES_DROPPED);
             }
             /* Socket remains live until session cleanup takes ports_lock. */
-            stop_port_io(port->fd);
+            stop_port_io(port);
         }
     }
 
@@ -628,11 +640,15 @@ static void *receiver_thread(void *arg)
     FrameHeader header;
     uint8_t payload[FRAME_MAX_PAYLOAD];
     for (;;) {
-        int result = frame_read(port->fd, &header, payload);
+        int result = port->pipe_link != NULL
+            ? pipe_link_receive(port->pipe_link, &header, payload)
+            : frame_read(port->fd, &header, payload);
         if (result == 0) 
             return NULL;
 
         if (result < 0) {
+            if (port->pipe_link != NULL && errno == ECANCELED)
+                return NULL;
             switch_error("frame_read");
             port->receive_status = EXIT_FAILURE;
             return NULL;
@@ -653,10 +669,7 @@ static void *receiver_thread(void *arg)
 
             frame_queue_close(&port->output);
 
-            if (shutdown(port->fd, SHUT_RDWR) == -1 && errno != ENOTCONN) {
-                switch_error("shutdown client");
-                port->receive_status = EXIT_FAILURE;
-            }
+            stop_port_io(port);
 
             return NULL;
         }
@@ -684,7 +697,9 @@ static void *sender_thread(void *arg)
                 abort();
             continue;
         }
-        int result = frame_write(port->fd, &frame->header, frame->payload);
+        int result = port->pipe_link != NULL
+            ? pipe_link_send(port->pipe_link, &frame->header, frame->payload)
+            : frame_write(port->fd, &frame->header, frame->payload);
         int write_error = errno;
         shared_frame_release(frame);
         if (pthread_mutex_unlock(&port->transmit_lock) != 0)
@@ -695,10 +710,10 @@ static void *sender_thread(void *arg)
             continue;
         }
         errno = write_error;
-        switch_error("frame_write");
+        if (port->pipe_link == NULL || errno != ECANCELED)
+            switch_error("frame_write");
         frame_queue_close(&port->output);
-        if (shutdown(port->fd, SHUT_RDWR) == -1 && errno != ENOTCONN)
-            switch_error("shutdown client");
+        stop_port_io(port);
         break;
     }
     return NULL;
@@ -766,9 +781,14 @@ static void *mac_aging_worker(void *arg)
     return NULL;
 }
 
-static void stop_port_io(int fd)
+static void stop_port_io(Port *port)
 {
-    if (shutdown(fd, SHUT_RDWR) == -1 && errno != ENOTCONN) {
+    if (port->pipe_link != NULL) {
+        if (pipe_link_stop(port->pipe_link) == -1)
+            switch_error("pipe_link_stop");
+        return;
+    }
+    if (shutdown(port->fd, SHUT_RDWR) == -1 && errno != ENOTCONN) {
         switch_error("shutdown client");
     }
 }
@@ -792,7 +812,7 @@ static void *port_session(void *arg)
 
     frame_queue_close(&port->output);
     rate_limit_close(&port->limiter);
-    stop_port_io(port->fd);
+    stop_port_io(port);
 
     if (error == 0) {
         join_worker(sender);
@@ -809,13 +829,13 @@ static void *port_session(void *arg)
 
     frame_queue_destroy(&port->output);
 
-    if (close(port->fd) == -1) {
+    if (port->pipe_link == NULL && close(port->fd) == -1) {
         switch_error("close client");
     }
     port->fd = -1;
 
     /* Publish the free slot and its permit atomically with respect to admin. */
-    if (!port->disabled && sem_post(port->free_ports) == -1) {
+    if (port->pipe_link == NULL && !port->disabled && sem_post(port->free_ports) == -1) {
         switch_error("sem_post");
         exit(EXIT_FAILURE);
     }
@@ -890,7 +910,7 @@ static int dump_switch_mac(void *arg)
         return -1;
     }
 
-    FILE *file = fopen("mac_dump.txt", "w");
+    FILE *file = fopen(getenv("SWITCH_DUMP_PATH") != NULL ? getenv("SWITCH_DUMP_PATH") : "mac_dump.txt", "w");
     if (file == NULL) {
         switch_error("open MAC dump");
         return -1;
@@ -909,7 +929,7 @@ static int dump_switch_mac(void *arg)
     }
 
     if (status == 0) 
-        switch_log( "MAC table dumped to mac_dump.txt\n");
+        switch_log("MAC table dumped to %s", getenv("SWITCH_DUMP_PATH") != NULL ? getenv("SWITCH_DUMP_PATH") : "mac_dump.txt");
 
     return status;
 }
@@ -917,7 +937,7 @@ static int dump_switch_mac(void *arg)
 static int reload_switch_config(void *arg)
 {
     SwitchSignals *state = arg;
-    FILE *file = fopen("vswitch.conf", "r");
+    FILE *file = fopen(getenv("SWITCH_CONFIG_PATH") != NULL ? getenv("SWITCH_CONFIG_PATH") : "vswitch.conf", "r");
 
     if (file == NULL) {
         switch_error("open vswitch.conf");
@@ -995,7 +1015,8 @@ static int admit_client(AdminContext *admin, int fd, atomic_int *stopping)
         abort();
     int slot = 0;
     while (slot < admin->num_ports &&
-           (admin->ports[slot].fd != -1 || admin->ports[slot].disabled))
+           (admin->ports[slot].fd != -1 || admin->ports[slot].disabled ||
+            admin->ports[slot].pipe_link != NULL))
         slot++;
     if (pthread_mutex_unlock(admin->ports_lock) != 0)
         abort();
@@ -1057,7 +1078,7 @@ close_pending:
     return status;
 }
 
-static int serve_hosts(int listener, int num_ports, MacTable *mac_table, StatsHandle *stats, const sigset_t *signals,MacAging *aging)
+static int serve_hosts(int listener, int num_ports, MacTable *mac_table, StatsHandle *stats, const sigset_t *signals,MacAging *aging, PipeLink *pipe_link)
 {
     Port ports[MAX_TEST_PORTS] = {0};
     pthread_t sessions[MAX_TEST_PORTS];
@@ -1067,7 +1088,7 @@ static int serve_hosts(int listener, int num_ports, MacTable *mac_table, StatsHa
     sem_t free_ports;
     int status = EXIT_SUCCESS;
 
-    if (sem_init(&free_ports, 0, (unsigned int)num_ports) == -1) {
+    if (sem_init(&free_ports, 0, (unsigned int)(num_ports - (pipe_link != NULL))) == -1) {
         switch_error("sem_init");
         check_aging_thread(pthread_mutex_destroy(&admission_lock), "admission destroy");
     check_aging_thread(pthread_mutex_destroy(&ports_lock), "ports destroy");
@@ -1098,6 +1119,11 @@ static int serve_hosts(int listener, int num_ports, MacTable *mac_table, StatsHa
         .sessions = sessions,
         .session_started = session_started
     };
+
+    if (pipe_link != NULL) {
+        ports[num_ports - 1].pipe_link = pipe_link;
+        ports[num_ports - 1].trunk = 1;
+    }
 
     ControlServer control;
 
@@ -1192,12 +1218,37 @@ static int serve_hosts(int listener, int num_ports, MacTable *mac_table, StatsHa
         return EXIT_FAILURE;
     }
 
+    if (pipe_link != NULL) {
+        Port *trunk = &ports[num_ports - 1];
+        int error = rate_limit_init(&trunk->limiter, PORT_RATE_FPS, PORT_RATE_BURST);
+        if (error != 0) {
+            switch_log("Pipe rate limiter: %s", strerror(error));
+            status = EXIT_FAILURE;
+        } else {
+            check_aging_thread(pthread_mutex_lock(&ports_lock), "ports lock");
+            trunk->fd = pipe_link->read_fd;
+            frame_queue_init(&trunk->output);
+            trunk->active = 1;
+            error = pthread_create(&sessions[num_ports - 1], NULL, port_session, trunk);
+            if (error != 0) {
+                trunk->active = 0;
+                trunk->fd = -1;
+                frame_queue_destroy(&trunk->output);
+                rate_limit_destroy(&trunk->limiter);
+                status = EXIT_FAILURE;
+            } else {
+                session_started[num_ports - 1] = 1;
+            }
+            check_aging_thread(pthread_mutex_unlock(&ports_lock), "ports unlock");
+        }
+    }
+
     struct pollfd events[2] = {
         {.fd = listener, .events = POLLIN},
         {.fd = signal_pipe[0], .events = POLLIN}
     };
 
-    for (;;) {
+    for (; status == EXIT_SUCCESS;) {
              
         if (atomic_load(&signal_state.stopping)) 
             break;
@@ -1281,7 +1332,7 @@ static int serve_hosts(int listener, int num_ports, MacTable *mac_table, StatsHa
                 frame_queue_close(&ports[i].output);
                 rate_limit_close(&ports[i].limiter);
             }
-            stop_port_io(ports[i].fd);
+            stop_port_io(&ports[i]);
         }
     }
 
@@ -1334,12 +1385,38 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
+    PipeLink inherited_link;
+    PipeLink *pipe_link = NULL;
+    const char *read_text = getenv("SWITCH_PIPE_READ_FD");
+    const char *write_text = getenv("SWITCH_PIPE_WRITE_FD");
+    if (read_text != NULL || write_text != NULL) {
+        char *end_read = NULL, *end_write = NULL;
+        errno = 0;
+        long read_fd = read_text != NULL ? strtol(read_text, &end_read, 10) : -1;
+        int read_error = errno;
+        errno = 0;
+        long write_fd = write_text != NULL ? strtol(write_text, &end_write, 10) : -1;
+        if (read_error || errno || read_text == NULL || write_text == NULL ||
+            end_read == read_text || end_write == write_text || *end_read || *end_write ||
+            read_fd < 0 || write_fd < 0 || read_fd > INT_MAX || write_fd > INT_MAX ||
+            num_ports < 2) {
+            fprintf(stderr, "Invalid inherited pipe descriptors or port count\n");
+            return EXIT_FAILURE;
+        }
+        if (pipe_link_adopt(&inherited_link, (int)read_fd, (int)write_fd) == -1) {
+            perror("pipe_link_adopt");
+            return EXIT_FAILURE;
+        }
+        pipe_link = &inherited_link;
+    }
+
     AsyncLogger logger;
     const char *log_path = getenv("SWITCH_LOG_PATH");
     if (log_path == NULL)
         log_path = "switch.log";
     if (async_logger_start(&logger, log_path) == -1) {
         perror("async_logger_start");
+        if (pipe_link != NULL) pipe_link_destroy(pipe_link);
         return EXIT_FAILURE;
     }
     atomic_init(&logging_errors, 0);
@@ -1349,6 +1426,7 @@ int main(int argc, char *argv[])
     int listener = socket(AF_INET, SOCK_STREAM, 0);
     if (listener == -1) {
         switch_error("socket");
+        if (pipe_link != NULL) pipe_link_destroy(pipe_link);
         runtime_logger = NULL;
         if (async_logger_stop(&logger) == -1)
             perror("async_logger_stop");
@@ -1356,6 +1434,12 @@ int main(int argc, char *argv[])
     }
 
     int status = EXIT_FAILURE;
+    int reuse_address = 1;
+    if (setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &reuse_address,
+                   sizeof(reuse_address)) == -1) {
+        switch_error("setsockopt SO_REUSEADDR");
+        goto close_listener;
+    }
     struct sockaddr_in address = {
         .sin_family = AF_INET,
         .sin_port = htons((uint16_t)port),
@@ -1416,7 +1500,7 @@ int main(int argc, char *argv[])
         switch_log( "pthread_create MAC aging: %s\n", strerror(error));
         status = EXIT_FAILURE;
     } else {
-        status = serve_hosts(listener, num_ports, &mac_table, &stats,&managed_signals, &aging);
+        status = serve_hosts(listener, num_ports, &mac_table, &stats,&managed_signals, &aging, pipe_link);
         check_aging_thread(pthread_mutex_lock(&aging.mutex), "aging lock");
         aging.stop = 1;
         check_aging_thread(pthread_cond_signal(&aging.wake), "aging signal");
@@ -1443,6 +1527,10 @@ int main(int argc, char *argv[])
     }
 
 close_listener:
+    if (pipe_link != NULL && pipe_link_destroy(pipe_link) == -1) {
+        switch_error("pipe_link_destroy");
+        status = EXIT_FAILURE;
+    }
     if (close(listener) == -1) {
         switch_error("close listener");
         status = EXIT_FAILURE;

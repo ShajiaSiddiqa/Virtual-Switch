@@ -48,3 +48,6 @@ switch.local.conf
 /mac_dump.txt
 /src/*.bak
 /inc/*.bak
+
+# Downloaded update archives and local backups
+/*.tar.gz

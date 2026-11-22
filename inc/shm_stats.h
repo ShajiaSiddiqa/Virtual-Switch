@@ -24,6 +24,7 @@ typedef struct {
 } SharedStats;
 
 typedef struct {
+    char name[256];
     int fd;
     int owner;
     SharedStats *shared;
